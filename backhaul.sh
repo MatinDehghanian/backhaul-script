@@ -141,52 +141,38 @@ install_jq() {
     fi
 }
 
-download_and_extract_backhaul() {
+download_backhaul() {
     if [[ "$1" == "menu" ]]; then
-        rm -rf "${config_dir}/backhaul_premium" >/dev/null 2>&1
         colorize cyan "Restart all services after updating to new core" bold
         sleep 2
+    elif [[ -f "${config_dir}/backhaul_premium" ]]; then
+        chmod +x "${config_dir}/backhaul_premium" || exit 1
+        return 0
     fi
 
-    [[ -f "${config_dir}/backhaul_premium" ]] && return 1
-
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64)
-            PRIMARY_URL="http://194.9.6.93/backhaul_premium_linux_amd64.tar.gz"
-            FALLBACK_URL="http://194.9.6.93/backhaul_premium_linux_amd64.tar.gz"
-            ;;
-        arm64|aarch64)
-            PRIMARY_URL="http://194.9.6.93/backhaul_premium_linux_arm64.tar.gz"
-            FALLBACK_URL="http://194.9.6.93/backhaul_premium_linux_arm64.tar.gz"
-            ;;
-        *)
-            colorize red "Unsupported architecture: $ARCH."
-            exit 1
-            ;;
-    esac
-
-    DOWNLOAD_DIR=$(mktemp -d)
+    local download_url="https://raw.githubusercontent.com/MatinDehghanian/backhaul-script/refs/heads/main/backhaul"
+    local download_dir
+    mkdir -p "$config_dir" || exit 1
+    download_dir=$(mktemp -d "${config_dir}/.backhaul-download.XXXXXX") || exit 1
     echo "Downloading Backhaul..."
 
-    if ! curl -sSL --max-time 10 -o "$DOWNLOAD_DIR/backhaul.tar.gz" "$PRIMARY_URL"; then
-        colorize yellow "Primary download failed. Trying fallback..."
-        curl -sSL --max-time 30 -o "$DOWNLOAD_DIR/backhaul.tar.gz" "$FALLBACK_URL" || {
-            colorize red "Download failed."
-            rm -rf "$DOWNLOAD_DIR"
-            exit 1
-        }
+    if ! curl -fSL --retry 2 --max-time 30 -o "$download_dir/backhaul" "$download_url"; then
+        colorize red "Download failed."
+        rm -rf "$download_dir"
+        exit 1
     fi
 
-    mkdir -p "$config_dir"
-    tar -xzf "$DOWNLOAD_DIR/backhaul.tar.gz" -C "$config_dir"
-    chmod u+x "${config_dir}/backhaul_premium"
-  #  rm -rf "$DOWNLOAD_DIR" "${config_dir}/LICENSE" "${config_dir}/README.md"
+    if ! chmod +x "$download_dir/backhaul" || ! mv -f "$download_dir/backhaul" "${config_dir}/backhaul_premium"; then
+        colorize red "Backhaul installation failed."
+        rm -rf "$download_dir"
+        exit 1
+    fi
+    rm -rf "$download_dir"
     colorize green "Backhaul installation completed."
 }
 
 install_jq
-download_and_extract_backhaul
+download_backhaul
 
 # ============================================================================
 # CONFIGURATION SECTIONS - MODULAR PROMPTING
@@ -1266,7 +1252,7 @@ read_option() {
         1) configure_tunnel ;;
         2) tunnel_management ;;
         3) check_tunnel_status ;;
-        4) download_and_extract_backhaul "menu" ;;
+        4) download_backhaul "menu" ;;
         5) update_script ;;
         6) remove_core ;;
         0) exit 0 ;;
