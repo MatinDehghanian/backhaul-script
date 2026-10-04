@@ -1,0 +1,31 @@
+# BackPack feature review
+
+Reviewed [AminMGMT/BackPack](https://github.com/AminMGMT/BackPack) on October 4, 2026, at commit [`ff86354bcafbd054e7888e48343145323c9b2207`](https://github.com/AminMGMT/BackPack/tree/ff86354bcafbd054e7888e48343145323c9b2207).
+
+This is a feature and compatibility review for the Bash Backhaul manager, not a security audit of every BackPack engine. The implementation here is independent and keeps using the existing Backhaul executable and TOML schema.
+
+The review covered the CLI feature inventory and documentation for connection testing, link tests, health checks, setup links, performance presets, port mappings, fallback/failover, monitoring, backup/restore, updates, managed servers, access control and the web panel. Implementation reads focused on `internal/manage/conntest*.go`, `benchmarkmenu.go`, `linktest.go`, `sharelink*.go`, `linkapply.go`, and `health/diagnose.go`.
+
+| BackPack feature | Backhaul decision |
+| --- | --- |
+| [Connection Test](https://github.com/AminMGMT/BackPack/blob/ff86354bcafbd054e7888e48343145323c9b2207/internal/manage/conntestmenu.go) | Adapted as a real traffic test of one selected existing tunnel and one port mapping. A temporary authenticated backend responder verifies echoes and a bulk transfer. No extra tunnel cores or simultaneous transport candidates. |
+| [Link Test](https://github.com/AminMGMT/BackPack/blob/main/docs/choosing-a-transport.md) | Added ten sequential TCP reachability probes for one selected tunnel. Labels connect failures accurately rather than claiming measured network packet loss. IPX skips this TCP probe. |
+| [Setup links](https://github.com/AminMGMT/BackPack/blob/main/docs/cli-menu.md) | Added a versioned `backhaul://` format for IRAN-to-KHAREJ pairing, shared credentials/settings, reversed TUN/IPX addresses, a local-interface prompt, a preview, and updates of an existing paired client. Rejects unknown fields, wrong types and incompatible formats. |
+| Generated tokens | Added random 32-byte tokens/PSKs for new setups; existing credentials are preserved. |
+| [Health checks](https://github.com/AminMGMT/BackPack/blob/main/docs/health-check.md) | Added per-tunnel service/core checks, certificate expiry, token checks, paths and recent logs. No automatic changes or checks of all tunnels at once. |
+| Start/stop management | Added per-service start/stop alongside the existing restart/log/status actions. |
+| [Backup & restore](https://github.com/AminMGMT/BackPack/blob/main/docs/backup-restore.md) | Added restore of the selected tunnel's existing config backup with restart and rollback. A whole-server archive or fleet-credential backup is outside this manager's current state model. |
+| Edit transport and settings | Already supported by the easy editor, including prompts for new transport dependencies and restart rollback. |
+| Forwarded UDP, real client IP and TCP MSS | Retained Backhaul's existing UDP/PROXY/tuning settings in the editor. The responder handles PROXY v1/v2 headers; no BackPack-specific MSS or framing implementation is substituted. |
+| [Performance presets](https://github.com/AminMGMT/BackPack/blob/main/docs/performance-presets.md) | Kept Backhaul's own tuning profiles and editor. BackPack's KCP queues/FEC/presets are engine-specific and cannot be translated safely into this binary's settings. |
+| [Port mappings](https://github.com/AminMGMT/BackPack/blob/main/docs/port-mappings.md) | Retained the formats this script already supports. Tests interpret single ports, pairs and ranges, one chosen port at a time. BackPack's backend pools and host-binding extensions are not assumed to exist in this core. |
+| [Transport fallback](https://github.com/AminMGMT/BackPack/blob/main/docs/transport-fallback.md), [address failover](https://github.com/AminMGMT/BackPack/blob/main/docs/failover-load-balancing.md) | Require corresponding support in the tunnel engine. No unsupported config keys or automatic carrier rotation were added. Use the editor and paired setup link to change one transport deliberately. |
+| L3/direct carriers, KCP/FEC, QUIC, stealth, spoofing | BackPack implementations, not interchangeable Backhaul transports. Not added to the Bash transport list. |
+| Metrics, quotas and automatic liveness tuning | Need verified runtime metrics and engine behavior. Echo test measurements remain diagnostic; they do not silently rewrite timers or limits. |
+| Scheduled restarts/watchdog | Existing systemd restart policy remains. Added explicit selected-tunnel recovery actions instead of a new background process that might start conflicting tunnel instances. |
+| Verified updates | BackPack's release checksums describe its binary, not this repository's raw executable. The requested raw Backhaul download remains; no unrelated checksums or archives are used. |
+| Web panel, managed-server SSH, Telegram, fleet access control | Separate services and credential stores rather than small Bash menu features. Not introduced into this manager. |
+| Built-in SOCKS5/HTTP proxy | BackPack's engine supplies this backend. This manager continues forwarding to the user's backend service; no unauthenticated proxy or extra relay daemon is installed. |
+| System-wide Optimize, restart-all and address ranking | Kept the existing Backhaul tuning choices and per-tunnel actions. No global kernel changes, bulk restart or multiple-address tests are run by the new diagnostics. |
+
+Validation covers link roundtrips for every supported transport, literal credentials, TUN/IPX pairing, duplicate prevention, import failure cleanup, menu/editor regression, selected-mapping isolation, occupied-port refusal, diagnostic locks/cancellation, PROXY headers and a full 60-second loopback echo/bulk test. Linux Backhaul/systemd behavior still needs an actual deployment test on the user's two servers.

@@ -1,7 +1,12 @@
 #!/bin/bash
 
 # Define script version
-SCRIPT_VERSION="v1.0.0"
+SCRIPT_VERSION="v1.1.0"
+
+if ((BASH_VERSINFO[0] < 4)); then
+    echo "This script requires Bash 4 or newer."
+    exit 1
+fi
 
 # Global Variables
 service_dir="/etc/systemd/system"
@@ -63,7 +68,11 @@ prompt_with_default() {
 
     echo -ne "[-] $prompt (default: $default): "
     read -r input
-    eval "$var_name=\"${input:-$default}\""
+    printf -v "$var_name" '%s' "${input:-$default}"
+}
+
+toml_string_setting() {
+    printf '%s = %s\n' "$1" "$(jq -cn --arg value "$2" '$value')"
 }
 
 prompt_boolean() {
@@ -82,7 +91,7 @@ prompt_boolean() {
 }
 
 validate_cidr() {
-    local cidr="$1"
+    local cidr="$1" ip mask a b c d
 
     if [[ ! "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]{1,2})$ ]]; then
         return 1
@@ -90,6 +99,9 @@ validate_cidr() {
 
     IFS='/' read -r ip mask <<< "$cidr"
     IFS='.' read -r a b c d <<< "$ip"
+
+    # Parse decimal explicitly so input such as /08 cannot trigger octal errors.
+    a=$((10#$a)); b=$((10#$b)); c=$((10#$c)); d=$((10#$d)); mask=$((10#$mask))
 
     if (( a<0 || a>255 || b<0 || b>255 || c<0 || c>255 || d<0 || d>255 )); then
         return 1
@@ -276,12 +288,14 @@ prompt_security_section() {
                 fi
             done
 
-            prompt_with_default "PSK (32-char base64)" "pN9m6m0tH3nE3V8xKZ6Lq5yYcW2K1S7QG9u4cF0A8M4=" CONFIG[psk]
+            local generated_psk
+            generated_psk=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+            prompt_with_default "PSK (base64-encoded 32 bytes)" "$generated_psk" CONFIG[psk]
             prompt_with_default "KDF Iterations" "100000" CONFIG[kdf_iterations]
         fi
     else
         # Non-IPX - use token
-        prompt_with_default "Security Token" "your_token" CONFIG[token]
+        prompt_with_default "Security Token" "$(random_secret)" CONFIG[token]
         CONFIG[enable_encryption]="false"
     fi
     echo ""
@@ -637,16 +651,16 @@ generate_toml_config() {
         # Connection section
         if [[ "$mode" == "server" ]] && [[ "$is_ipx" == "false" ]]; then
             echo "[listener]"
-            echo "bind_addr = \"${CONFIG[bind_addr]}\""
+            toml_string_setting "bind_addr" "${CONFIG[bind_addr]}"
             #echo "bind_addrs = ${CONFIG[bind_addrs]}"
             echo ""
         elif [[ "$is_ipx" == "false" ]]; then
             echo "[dialer]"
-            echo "remote_addr = \"${CONFIG[remote_addr]}\""
+            toml_string_setting "remote_addr" "${CONFIG[remote_addr]}"
             #echo "remote_addrs = ${CONFIG[remote_addrs]}"
-            #[[ -n "${CONFIG[local_addr]}" ]] && echo "local_addr = \"${CONFIG[local_addr]}\""
+            #[[ -n "${CONFIG[local_addr]}" ]] && toml_string_setting "local_addr" "${CONFIG[local_addr]}"
             #echo "local_addrs = ${CONFIG[local_addrs]}"
-            [[ -n "${CONFIG[edge_ip]}" ]] && echo "edge_ip = \"${CONFIG[edge_ip]}\""
+            [[ -n "${CONFIG[edge_ip]}" ]] && toml_string_setting "edge_ip" "${CONFIG[edge_ip]}"
             echo "dial_timeout = ${CONFIG[dial_timeout]}"
             echo "retry_interval = ${CONFIG[retry_interval]}"
             echo ""
@@ -655,7 +669,7 @@ generate_toml_config() {
 
         # Transport section
         echo "[transport]"
-        echo "type = \"${CONFIG[transport_type]}\""
+        toml_string_setting "type" "${CONFIG[transport_type]}"
         [[ -n "${CONFIG[nodelay]}" ]] && echo "nodelay = ${CONFIG[nodelay]}"
         [[ -n "${CONFIG[keepalive_period]}" ]] && echo "keepalive_period = ${CONFIG[keepalive_period]}"
 
@@ -675,10 +689,10 @@ generate_toml_config() {
         # TUN section (if tun transport)
         if [[ "$is_tun" == "true" ]]; then
             echo "[tun]"
-            echo "encapsulation = \"${CONFIG[tun_encapsulation]}\""
-            echo "name = \"${CONFIG[tun_name]}\""
-            echo "local_addr = \"${CONFIG[tun_local_addr]}\""
-            echo "remote_addr = \"${CONFIG[tun_remote_addr]}\""
+            toml_string_setting "encapsulation" "${CONFIG[tun_encapsulation]}"
+            toml_string_setting "name" "${CONFIG[tun_name]}"
+            toml_string_setting "local_addr" "${CONFIG[tun_local_addr]}"
+            toml_string_setting "remote_addr" "${CONFIG[tun_remote_addr]}"
             echo "health_port = ${CONFIG[tun_health_port]}"
             echo "mtu = ${CONFIG[tun_mtu]}"
             echo ""
@@ -687,11 +701,11 @@ generate_toml_config() {
         # IPX section (if ipx encapsulation)
         if [[ "$is_ipx" == "true" ]]; then
             echo "[ipx]"
-            echo "mode = \"${CONFIG[ipx_mode]}\""
-            echo "profile = \"${CONFIG[ipx_profile]}\""
-            echo "listen_ip = \"${CONFIG[ipx_listen_ip]}\""
-            echo "dst_ip = \"${CONFIG[ipx_dst_ip]}\""
-            echo "interface = \"${CONFIG[ipx_interface]}\""
+            toml_string_setting "mode" "${CONFIG[ipx_mode]}"
+            toml_string_setting "profile" "${CONFIG[ipx_profile]}"
+            toml_string_setting "listen_ip" "${CONFIG[ipx_listen_ip]}"
+            toml_string_setting "dst_ip" "${CONFIG[ipx_dst_ip]}"
+            toml_string_setting "interface" "${CONFIG[ipx_interface]}"
             [[ -n "${CONFIG[ipx_icmp_type]}" ]] && echo "icmp_type = ${CONFIG[ipx_icmp_type]}"
             [[ -n "${CONFIG[ipx_icmp_code]}" ]] && echo "icmp_code = ${CONFIG[ipx_icmp_code]}"
             echo ""
@@ -713,12 +727,12 @@ generate_toml_config() {
         if [[ "$is_ipx" == "true" ]]; then
             echo "enable_encryption = ${CONFIG[enable_encryption]}"
             [[ "${CONFIG[enable_encryption]}" == "true" ]] && {
-                echo "algorithm = \"${CONFIG[algorithm]}\""
-                echo "psk = \"${CONFIG[psk]}\""
+                toml_string_setting "algorithm" "${CONFIG[algorithm]}"
+                toml_string_setting "psk" "${CONFIG[psk]}"
                 echo "kdf_iterations = ${CONFIG[kdf_iterations]}"
             }
         else
-            echo "token = \"${CONFIG[token]}\""
+            toml_string_setting "token" "${CONFIG[token]}"
         fi
 
         echo ""
@@ -727,9 +741,9 @@ generate_toml_config() {
         if [[ -n "${CONFIG[tls_sni]}" || -n "${CONFIG[tls_cert]}" ]]; then
             echo "[tls]"
 
-            [[ -n "${CONFIG[tls_sni]}" ]]  && echo "sni = \"${CONFIG[tls_sni]}\""
-            [[ -n "${CONFIG[tls_cert]}" ]] && echo "tls_cert = \"${CONFIG[tls_cert]}\""
-            [[ -n "${CONFIG[tls_key]}" ]]  && echo "tls_key = \"${CONFIG[tls_key]}\""
+            [[ -n "${CONFIG[tls_sni]}" ]]  && toml_string_setting "sni" "${CONFIG[tls_sni]}"
+            [[ -n "${CONFIG[tls_cert]}" ]] && toml_string_setting "tls_cert" "${CONFIG[tls_cert]}"
+            [[ -n "${CONFIG[tls_key]}" ]]  && toml_string_setting "tls_key" "${CONFIG[tls_key]}"
 
             echo ""
         fi
@@ -737,13 +751,13 @@ generate_toml_config() {
         # Tuning section
         echo "[tuning]"
         [[ -n "${CONFIG[auto_tuning]}" ]]     && echo "auto_tuning = ${CONFIG[auto_tuning]}"
-        [[ -n "${CONFIG[tuning_profile]}" ]]  && echo "tuning_profile = \"${CONFIG[tuning_profile]}\""
+        [[ -n "${CONFIG[tuning_profile]}" ]]  && toml_string_setting "tuning_profile" "${CONFIG[tuning_profile]}"
         [[ -n "${CONFIG[workers]}" ]]         && echo "workers = ${CONFIG[workers]}"
         [[ -n "${CONFIG[channel_size]}" ]]    && echo "channel_size = ${CONFIG[channel_size]}"
         [[ -n "${CONFIG[tcp_mss]}" ]]         && echo "tcp_mss = ${CONFIG[tcp_mss]}"
         [[ -n "${CONFIG[so_rcvbuf]}" ]]       && echo "so_rcvbuf = ${CONFIG[so_rcvbuf]}"
         [[ -n "${CONFIG[so_sndbuf]}" ]]       && echo "so_sndbuf = ${CONFIG[so_sndbuf]}"
-        [[ -n "${CONFIG[buffer_profile]}" ]]  && echo "buffer_profile = \"${CONFIG[buffer_profile]}\""
+        [[ -n "${CONFIG[buffer_profile]}" ]]  && toml_string_setting "buffer_profile" "${CONFIG[buffer_profile]}"
         [[ -n "${CONFIG[batch_size]}" ]]      && echo "batch_size = ${CONFIG[batch_size]}"
         [[ -n "${CONFIG[read_timeout]}" ]]    && echo "read_timeout = ${CONFIG[read_timeout]}"
         #[[ -n "${CONFIG[max_connections]}" ]] && echo "max_connections = ${CONFIG[max_connections]}"
@@ -762,13 +776,13 @@ generate_toml_config() {
 
         # Logging section
         echo "[logging]"
-        echo "log_level = \"${CONFIG[log_level]}\""
+        toml_string_setting "log_level" "${CONFIG[log_level]}"
         echo ""
 
         # Ports section (if not client)
         if [[ "$mode" == "server" ]] ; then
             echo "[ports]"
-            [[ -n "${CONFIG[forwarder]}" ]]  && echo "forwarder = \"${CONFIG[forwarder]}\""
+            [[ -n "${CONFIG[forwarder]}" ]]  && toml_string_setting "forwarder" "${CONFIG[forwarder]}"
             echo "mapping = ["
             IFS=',' read -r -a ports <<< "${CONFIG[ports_mapping]}"
             for port in "${ports[@]}"; do
@@ -832,13 +846,15 @@ configure_server() {
 
     # Determine tunnel port
     local tunnel_port
-    if [[ "$mode" == "server" ]]; then
-        tunnel_port=$(echo "${CONFIG[bind_addr]}" | grep -oP ':\K[0-9]+$')
+    if [[ "$is_ipx" == true ]]; then
+        tunnel_port="${CONFIG[tun_health_port]}"
+    elif [[ "$mode" == "server" ]]; then
+        tunnel_port="${CONFIG[bind_addr]##*:}"
     else
-        tunnel_port=$(echo "${CONFIG[remote_addr]}" | grep -oP ':\K[0-9]+$')
+        tunnel_port="${CONFIG[remote_addr]##*:}"
     fi
-    if [[ -z "$tunnel_port" ]]; then
-        tunnel_port=$(echo "${CONFIG[tun_health_port]}")
+    if [[ ! "$tunnel_port" =~ ^[0-9]{1,5}$ ]] || ((10#$tunnel_port < 1 || 10#$tunnel_port > 65535)); then
+        colorize red 'Tunnel port must be 1-65535.'; press_key; return 1
     fi
 
     # Generate config file
@@ -849,15 +865,29 @@ configure_server() {
         config_file="${config_dir}/kharej${tunnel_port}.toml"
     fi
 
-    generate_toml_config "$mode" "$config_file" "$is_tun" "$is_ipx"
-
     # Create systemd service
     local service_type
     [[ "$mode" == "server" ]] && service_type="iran" || service_type="kharej"
-    create_systemd_service "$service_type" "$tunnel_port" "$config_file"
+    if [[ -e "$config_file" || -e "$service_dir/backhaul-${service_type}${tunnel_port}.service" ]]; then
+        colorize red 'A tunnel already uses this name/port. Use Tunnel management → Edit instead.'
+        press_key; return 1
+    fi
+    local temporary
+    temporary=$(mktemp "$config_dir/.setup.XXXXXX") || return 1
+    if ! generate_toml_config "$mode" "$temporary" "$is_tun" "$is_ipx" ||
+       ! edit_load_config "$temporary" || ! chmod 600 "$temporary" || ! ln "$temporary" "$config_file"; then
+        rm -f "$temporary"
+        colorize red 'Invalid settings or configuration could not be saved.'; press_key; return 1
+    fi
+    rm -f "$temporary"
+    create_systemd_service "$service_type" "$tunnel_port" "$config_file" || { press_key; return 1; }
 
     echo ""
     colorize green "✔ Configuration completed successfully!" bold
+    if [[ "$mode" == server ]]; then
+        echo 'KHAREJ setup link (contains credentials; keep private):'
+        peer_setup_link "$config_file"
+    fi
     echo ""
     press_key
 }
@@ -951,6 +981,7 @@ edit_load_config() {
 edit_value() {
     local value="${EDIT_VALUES[$1]:-$2}"
     [[ -n "$value" ]] && printf '%s' "$value" | jq -r 'if type == "array" then join(", ") else . end'
+    return 0
 }
 
 # Fields are listed in menu order with defaults for settings absent from a file.
@@ -1437,10 +1468,599 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable --now "backhaul-${type}${port}.service" >/dev/null 2>&1
+    if ! systemctl daemon-reload || ! systemctl enable --now "backhaul-${type}${port}.service" ||
+       ! sleep 1 || ! systemctl is-active --quiet "backhaul-${type}${port}.service"; then
+        colorize red "Service backhaul-${type}${port} failed to start. Check its service logs."
+        return 1
+    fi
 
     colorize green "✔ Service backhaul-${type}${port} created and started" bold
+}
+
+# ============================================================================
+# SETUP LINKS AND SINGLE-TUNNEL DIAGNOSTICS
+# ============================================================================
+
+random_secret() {
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+settings_json() {
+    local id separator=""
+    {
+        printf '{'
+        while IFS= read -r id; do
+            printf '%s"%s":%s' "$separator" "$id" "${EDIT_VALUES[$id]}"
+            separator=,
+        done < <(printf '%s\n' "${!EDIT_VALUES[@]}" | sort)
+        printf '}'
+    } | jq -cS .
+}
+
+encode_backhaul_link() {
+    local scheme="$1" body="$2"
+    printf '%s://1.' "$scheme"
+    printf '%s' "$body" | base64 | tr -d '\n=' | tr '+/' '-_'
+    echo
+}
+
+decode_backhaul_link() {
+    local scheme="$1" raw="$2" payload decoded
+    # No fetching URLs or evaluating shell text; a link holds data only.
+    raw=$(edit_trim "$raw")
+    raw="${raw#\'}"; raw="${raw%\'}"; raw="${raw#\"}"; raw="${raw%\"}"
+    if [[ ${#raw} -gt 32768 || "$raw" != "$scheme://1."* ]]; then
+        colorize red "Expected a $scheme://1. link (maximum 32 KiB)." >&2
+        return 1
+    fi
+    payload="${raw#*://1.}"
+    [[ "$payload" =~ ^[A-Za-z0-9_-]+$ ]] || { colorize red 'Invalid link characters.' >&2; return 1; }
+    payload=$(printf '%s' "$payload" | tr '_-' '/+')
+    case $((${#payload}%4)) in
+        2) payload+='==' ;; 3) payload+='=' ;; 1) colorize red 'Link is cut short.' >&2; return 1 ;;
+    esac
+    decoded=$(printf '%s' "$payload" | base64 -d 2>/dev/null) || { colorize red 'Invalid link encoding.' >&2; return 1; }
+    printf '%s' "$decoded" | jq -ce 'select(type == "object" and .v == 1)' || {
+        colorize red 'Invalid or unsupported link version.' >&2; return 1;
+    }
+}
+
+valid_endpoint() {
+    local address="$1" port
+    [[ "$address" =~ ^([a-zA-Z0-9._-]+|\[[a-fA-F0-9:]+\]):([0-9]{1,5})$ ]] || return 1
+    port="${BASH_REMATCH[2]}"
+    ((10#$port >= 1 && 10#$port <= 65535))
+}
+
+peer_setup_link() {
+    local file="$1" edit_mode=client host port endpoint id section key default old_local old_listen
+    local -A allowed
+    [[ "$(basename "$file")" == iran*.toml ]] || { colorize red 'Export the setup link on the IRAN server.'; return 1; }
+    edit_load_config "$file" || return 1
+    if [[ "$(edit_value tun.encapsulation)" != ipx ]]; then
+        endpoint=$(edit_value listener.bind_addr)
+        port="${endpoint##*:}"
+        host="${endpoint%:*}"
+        [[ -z "$host" || "$host" == 0.0.0.0 || "$host" == '[::]' || "$host" == :: ]] && host="$SERVER_IP"
+        echo 'Enter the IRAN address the KHAREJ server can reach.' >&2
+        read -r -p "IRAN IP/domain [$host]: " endpoint || return 1
+        host="${endpoint:-$host}"
+        [[ "$host" == *:* && "$host" != \[*\] ]] && host="[$host]"
+        endpoint="$host:$port"
+        valid_endpoint "$endpoint" || { colorize red 'Invalid IRAN address or port.'; return 1; }
+        EDIT_VALUES[dialer.remote_addr]=$(jq -cn --arg value "$endpoint" '$value')
+        EDIT_VALUES[dialer.dial_timeout]=10
+        EDIT_VALUES[dialer.retry_interval]=3
+        EDIT_VALUES[transport.connection_pool]=8
+    else
+        old_listen="${EDIT_VALUES[ipx.listen_ip]}"
+        EDIT_VALUES[ipx.listen_ip]="${EDIT_VALUES[ipx.dst_ip]}"
+        EDIT_VALUES[ipx.dst_ip]="$old_listen"
+        EDIT_VALUES[ipx.mode]='"client"'
+        unset 'EDIT_VALUES[ipx.interface]'
+    fi
+    if [[ "$(edit_value transport.type)" == tun ]]; then
+        old_local="${EDIT_VALUES[tun.local_addr]}"
+        EDIT_VALUES[tun.local_addr]="${EDIT_VALUES[tun.remote_addr]}"
+        EDIT_VALUES[tun.remote_addr]="$old_local"
+    fi
+    unset 'EDIT_VALUES[tls.tls_cert]' 'EDIT_VALUES[tls.tls_key]'
+    edit_normalize
+    # Transfer only settings supported by this script, excluding host-local extras.
+    for section in "${EDIT_SECTIONS[@]}"; do
+        while IFS='|' read -r key default; do allowed[$section.$key]=true; done < <(edit_fields "$section")
+    done
+    allowed[ipx.mode]=true
+    for id in "${!EDIT_VALUES[@]}"; do
+        [[ -n "${allowed[$id]}" ]] || unset 'EDIT_VALUES[$id]'
+    done
+    encode_backhaul_link backhaul "$(settings_json | jq -c '{v:1,kind:"setup",role:"client",settings:.}')"
+}
+
+validate_setup_settings() {
+    local edit_mode=client id section key default type value choices psk_hex
+    local -A allowed
+    case "$(edit_value transport.type)" in tcp|tcpmux|xtcpmux|ws|wss|wsmux|wssmux|xwsmux|anytls|tun) ;; *) colorize red 'Unsupported transport in link.'; return 1 ;; esac
+    if [[ "$(edit_value transport.type)" == tun ]]; then
+        case "$(edit_value tun.encapsulation)" in tcp|ipx) ;; *) colorize red 'Invalid TUN encapsulation.'; return 1 ;; esac
+    fi
+    edit_sections
+    for section in "${EDIT_SECTIONS[@]}"; do
+        while IFS='|' read -r key default; do
+            allowed[$section.$key]=$(printf '%s' "$default" | jq -r type)
+        done < <(edit_fields "$section")
+    done
+    [[ "$(edit_value tun.encapsulation)" == ipx ]] && allowed[ipx.mode]=string
+    for id in "${!EDIT_VALUES[@]}"; do
+        type=$(printf '%s' "${EDIT_VALUES[$id]}" | jq -r type)
+        if [[ -z "${allowed[$id]}" || "$type" != "${allowed[$id]}" ]]; then
+            colorize red "Unsupported setting or wrong type: $id"; return 1
+        fi
+        value=$(edit_value "$id")
+        [[ ${#value} -le 2048 ]] || { colorize red "Setting too long: $id"; return 1; }
+        if [[ "$type" == number ]]; then
+            printf '%s' "${EDIT_VALUES[$id]}" | jq -e '. >= 0 and . <= 2147483647 and floor == .' >/dev/null || return 1
+        fi
+        choices=$(edit_choices "$id")
+        [[ -z "$choices" || " $choices " == *" $value "* ]] || { colorize red "Invalid choice: $id"; return 1; }
+    done
+    if [[ "$(edit_value tun.encapsulation)" != ipx ]]; then
+        valid_endpoint "$(edit_value dialer.remote_addr)" || { colorize red 'Missing/invalid remote address.'; return 1; }
+        [[ -n "$(edit_value security.token)" ]] || { colorize red 'Missing security token.'; return 1; }
+    else
+        [[ "$(edit_value ipx.mode)" == client && -n "$(edit_value ipx.listen_ip)" && -n "$(edit_value ipx.dst_ip)" ]] || return 1
+        [[ -n "${EDIT_VALUES[security.enable_encryption]}" ]] || return 1
+        if [[ "$(edit_value security.enable_encryption)" == true ]]; then
+            psk_hex=$(set -o pipefail; printf '%s' "$(edit_value security.psk)" | base64 -d 2>/dev/null | od -An -v -tx1 | tr -d ' \n') || {
+                colorize red 'Invalid base64 encoding for the IPX PSK.'; return 1;
+            }
+            [[ ${#psk_hex} -eq 64 ]] || {
+                colorize red 'IPX encryption requires a base64-encoded 32-byte PSK.'; return 1;
+            }
+        fi
+    fi
+    if [[ "$(edit_value transport.type)" == tun ]]; then
+        validate_cidr "$(edit_value tun.local_addr)" && validate_cidr "$(edit_value tun.remote_addr)" || return 1
+        value=$(edit_value tun.health_port)
+        [[ "$value" =~ ^[0-9]{1,5}$ ]] && ((10#$value >= 1 && 10#$value <= 65535)) || return 1
+    fi
+    return 0
+}
+
+load_setup_link() {
+    local raw="$1" json id value
+    json=$(decode_backhaul_link backhaul "$raw") || return 1
+    printf '%s' "$json" | jq -e '
+        .kind == "setup" and .role == "client" and (.settings | type == "object") and
+        (.settings | length > 0 and length <= 100) and
+        all(.settings | to_entries[]; (.key | test("^[a-z_]+\\.[a-z_]+$")) and
+            (.value | type == "string" or type == "boolean" or type == "number"))' >/dev/null || {
+        colorize red 'Invalid setup link. No files changed.'; return 1;
+    }
+    EDIT_VALUES=()
+    while IFS=$'\t' read -r id value; do EDIT_VALUES[$id]="$value"; done < <(
+        printf '%s' "$json" | jq -r '.settings | to_entries[] | .key + "\t" + (.value | tojson)')
+    validate_setup_settings
+}
+
+same_setup_identity() {
+    local expected="$1" current
+    current="${EDIT_VALUES[security.token]:-${EDIT_VALUES[security.psk]:-}}"
+    [[ -n "$expected" && "$current" == "$expected" ]]
+}
+
+install_link_settings() {
+    local edit_mode=client port file candidate identity temporary service matches=0 existing="" id
+    local -A incoming
+    identity="${EDIT_VALUES[security.token]:-${EDIT_VALUES[security.psk]:-}}"
+    for id in "${!EDIT_VALUES[@]}"; do incoming[$id]="${EDIT_VALUES[$id]}"; done
+    for candidate in "$config_dir"/kharej*.toml; do
+        [[ -f "$candidate" ]] || continue
+        if edit_load_config "$candidate" && same_setup_identity "$identity"; then
+            existing="$candidate"; ((matches+=1))
+        fi
+    done
+    EDIT_VALUES=()
+    for id in "${!incoming[@]}"; do EDIT_VALUES[$id]="${incoming[$id]}"; done
+    ((matches <= 1)) || { colorize red 'Multiple tunnels share this credential. Edit the intended tunnel manually.'; return 1; }
+    edit_complete_transport || return 1
+    incoming=()
+    for id in "${!EDIT_VALUES[@]}"; do incoming[$id]="${EDIT_VALUES[$id]}"; done
+    port="$(edit_value dialer.remote_addr)"; port="${port##*:}"
+    [[ "$(edit_value tun.encapsulation)" == ipx ]] && port=$(edit_value tun.health_port)
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || return 1
+    file="${existing:-$config_dir/kharej$port.toml}"
+    service="backhaul-$(basename "${file%.toml}").service"
+    if [[ -z "$existing" && ( -e "$file" || -e "$service_dir/$service" ) ]]; then
+        colorize red "A different tunnel already uses $file. Edit or remove it first."; return 1
+    fi
+    if [[ "$(edit_value transport.type)" == tun ]]; then
+        local name="${EDIT_VALUES[tun.name]}"
+        for candidate in "$config_dir"/{iran,kharej}*.toml; do
+            [[ -f "$candidate" && "$candidate" != "$existing" ]] || continue
+            if edit_load_config "$candidate" && [[ "${EDIT_VALUES[tun.name]}" == "$name" ]]; then
+                colorize red 'Another tunnel uses this TUN device. Edit/remove it before importing.'; return 1
+            fi
+        done
+        EDIT_VALUES=()
+        for id in "${!incoming[@]}"; do EDIT_VALUES[$id]="${incoming[$id]}"; done
+        edit_sections
+    fi
+    colorize cyan "Setup preview: ${existing:+update }$service" bold
+    echo "Transport: $(edit_value transport.type)"
+    echo "IRAN address: $(edit_value dialer.remote_addr "${EDIT_VALUES[ipx.dst_ip]}")"
+    [[ "$(edit_value transport.type)" == tun ]] && echo "TUN: $(edit_value tun.local_addr) → $(edit_value tun.remote_addr)"
+    echo "Config: $file"
+    local confirm
+    read -r -p 'Apply these settings and start this tunnel? [y/N]: ' confirm || return 1
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+    if [[ -n "$existing" ]]; then
+        edit_save_config "$file" "$service"
+        return $?
+    fi
+    temporary=$(mktemp "$config_dir/.link.XXXXXX") || return 1
+    if ! edit_write_config "$temporary" || ! chmod 600 "$temporary" || ! ln "$temporary" "$file"; then
+        rm -f "$temporary"; return 1
+    fi
+    rm -f "$temporary"
+    if ! create_systemd_service kharej "$port" "$file"; then
+        systemctl disable --now "$service" >/dev/null 2>&1
+        rm -f "$file" "$service_dir/$service"
+        systemctl daemon-reload
+        colorize red 'Setup failed. The new config and service were removed.'
+        return 1
+    fi
+}
+
+setup_from_link() {
+    local raw
+    echo 'Paste the backhaul://1. link generated on your IRAN server.'
+    read -r -p 'Setup link (blank to cancel): ' raw || return 1
+    [[ -n "$raw" ]] || return 0
+    load_setup_link "$raw" && install_link_settings
+    press_key
+}
+
+show_setup_link() {
+    echo 'Copy this link to KHAREJ → Configure a new tunnel → Setup from link.'
+    echo 'The link contains your tunnel credentials. Keep it private.'
+    peer_setup_link "$1"
+    press_key
+}
+
+# Python is needed only for diagnostics, keeping socket timeouts and exact
+# byte comparisons portable. It starts no Backhaul processes or systemd units.
+connection_tool() {
+    command -v python3 >/dev/null || {
+        colorize red 'Diagnostics require python3. Install it with: apt-get install -y python3' >&2
+        return 1
+    }
+    # Pass credentials through a private descriptor, not public process arguments.
+    python3 - 3< <(printf '%s\0' "$config_dir/.connection-test.lock" "$@") <<'PY'
+import fcntl, hashlib, os, socket, statistics, struct, sys, time
+
+def recv_exact(sock, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError('connection closed during transfer')
+        data.extend(chunk)
+    return bytes(data)
+
+def connect(host, port):
+    return socket.create_connection((host, int(port)), timeout=3)
+
+def route(host, port):
+    times = []
+    for n in range(10):
+        start = time.monotonic()
+        try:
+            with connect(host, port):
+                times.append((time.monotonic() - start) * 1000)
+                print(f'Probe {n+1}/10: {times[-1]:.1f} ms', flush=True)
+        except OSError as exc:
+            print(f'Probe {n+1}/10 failed: {exc}', flush=True)
+        time.sleep(.25)
+    print(f'TCP connection success: {len(times)}/10 ({len(times)*10}%).')
+    if times:
+        jitter = statistics.pstdev(times)
+        print(f'Connect latency: min {min(times):.1f}, avg {statistics.mean(times):.1f}, '
+              f'max {max(times):.1f} ms; standard deviation {jitter:.1f} ms.')
+    print('This measures TCP reachability, not authentication, packet loss or tunnel throughput.')
+    return 0 if times else 1
+
+def responder(host, port, secret):
+    family = socket.AF_INET6 if ':' in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as listener:
+        # Reuse TIME_WAIT sockets after a test, never another active listener.
+        # No SO_REUSEPORT: an occupied backend must be refused, never taken over.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((host, int(port)))
+        listener.listen(1)
+        listener.settimeout(1)
+        deadline = time.monotonic() + 600
+        print(f'Ready on {host}:{port}. Run the IRAN test now. Ctrl+C cancels; expires in 10 minutes.', flush=True)
+        while time.monotonic() < deadline:
+            try:
+                client, _ = listener.accept()
+            except socket.timeout:
+                continue
+            with client:
+                client.settimeout(5)
+                try:
+                    expected = b'BACKHAUL-TEST-1 ' + secret.encode() + b'\n'
+                    prefix = recv_exact(client, 12)
+                    if prefix == b'\r\n\r\n\0\r\nQUIT\n':  # PROXY protocol v2
+                        header = recv_exact(client, 4)
+                        size = struct.unpack('!H', header[2:])[0]
+                        if header[0] >> 4 != 2 or size > 512:
+                            raise ValueError('invalid PROXY v2 header')
+                        recv_exact(client, size)
+                        prefix = b''
+                    elif prefix.startswith(b'PROXY '):  # PROXY protocol v1
+                        while not prefix.endswith(b'\r\n') and len(prefix) <= 108:
+                            prefix += recv_exact(client, 1)
+                        if not prefix.endswith(b'\r\n'):
+                            raise ValueError('invalid PROXY v1 header')
+                        prefix = b''
+                    if prefix + recv_exact(client, len(expected) - len(prefix)) != expected:
+                        continue
+                    client.sendall(expected)
+                    while time.monotonic() < deadline:
+                        size = struct.unpack('!I', recv_exact(client, 4))[0]
+                        if size == 0:
+                            print('Test finished. Temporary responder closed.', flush=True)
+                            return 0
+                        if size > 1024 * 1024:
+                            raise ValueError('oversized test frame')
+                        client.sendall(recv_exact(client, size))
+                except (OSError, ValueError) as exc:
+                    print(f'Test connection ended: {exc}', flush=True)
+        print('Responder expired and closed.')
+        return 1
+
+def traffic(host, port, secret):
+    times = []
+    try:
+        with connect(host, port) as sock:
+            sock.settimeout(5)
+            hello = b'BACKHAUL-TEST-1 ' + secret.encode() + b'\n'
+            sock.sendall(hello)
+            if recv_exact(sock, len(hello)) != hello:
+                raise ValueError('wrong responder; check selected mapping and test link')
+            for n in range(60):
+                data = os.urandom(64)
+                start = time.monotonic()
+                sock.sendall(struct.pack('!I', len(data)) + data)
+                if recv_exact(sock, len(data)) != data:
+                    raise ValueError('echo bytes did not match')
+                elapsed = time.monotonic() - start
+                times.append(elapsed * 1000)
+                print(f'Echo {n+1}/60: {times[-1]:.1f} ms', flush=True)
+                time.sleep(max(0, 1 - elapsed))
+            data = os.urandom(1024 * 1024)
+            start = time.monotonic()
+            sock.sendall(struct.pack('!I', len(data)) + data)
+            if recv_exact(sock, len(data)) != data:
+                raise ValueError('bulk echo bytes did not match')
+            elapsed = max(time.monotonic() - start, .000001)
+            sock.sendall(struct.pack('!I', 0))
+        print(f'PASS: 60/60 exact echoes and 1 MiB bulk echo through the selected tunnel.')
+        print(f'Round trip: min {min(times):.1f}, avg {statistics.mean(times):.1f}, max {max(times):.1f} ms; '
+              f'jitter (standard deviation) {statistics.pstdev(times):.1f} ms.')
+        print(f'Combined upload+download echo rate: {2*len(data)*8/elapsed/1e6:.2f} Mbit/s '
+              '(not separate one-way speeds).')
+        return 0
+    except (OSError, ValueError) as exc:
+        print(f'FAIL after {len(times)}/60 verified echoes: {exc}')
+        print('Check both tunnel services, matching credentials/transport, port mapping and the KHAREJ responder.')
+        return 1
+
+try:
+    tool_args = os.fdopen(3, 'rb').read().split(b'\0')[:-1]
+    lock_path, action, *args = [arg.decode() for arg in tool_args]
+    if action == 'fingerprint':
+        print(hashlib.sha256(args[0].encode()).hexdigest())
+        result = 0
+    else:
+        with open(lock_path, 'a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print('Another connection test is running here. Finish/cancel it first.')
+                sys.exit(1)
+            result = {'route': route, 'responder': responder, 'traffic': traffic}[action](*args)
+    sys.exit(result)
+except KeyboardInterrupt:
+    print('\nTest cancelled. Test sockets closed; tunnel settings unchanged.')
+    sys.exit(130)
+except (OSError, ValueError) as exc:
+    print(f'Test could not start: {exc}', file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+pair_fingerprint() {
+    local id separator="" body
+    body=$({
+        printf '{'
+        for id in transport.type tun.encapsulation mux.mux_version security.token security.enable_encryption security.algorithm security.psk security.kdf_iterations; do
+            [[ -n "${EDIT_VALUES[$id]}" ]] || continue
+            printf '%s"%s":%s' "$separator" "$id" "${EDIT_VALUES[$id]}"; separator=,
+        done
+        printf '}'
+    } | jq -cS .)
+    connection_tool fingerprint "$body"
+}
+
+quick_connection_test() {
+    local file="$1" endpoint host port
+    edit_load_config "$file" || return 1
+    if [[ "$(edit_value tun.encapsulation)" == ipx ]]; then
+        colorize yellow 'IPX does not have a TCP tunnel listener. Use the real traffic test for this tunnel.'
+        return 0
+    fi
+    if [[ "$(basename "$file")" == kharej* ]]; then
+        endpoint=$(edit_value dialer.remote_addr)
+        [[ -n "$(edit_value dialer.edge_ip)" ]] && colorize yellow 'This probe uses the IRAN address; the WebSocket edge may follow a different route.'
+    else
+        endpoint=$(edit_value listener.bind_addr)
+        colorize yellow 'Local listener check only. Run this on KHAREJ to measure the inter-server route.'
+    fi
+    port="${endpoint##*:}"; host="${endpoint%:*}"
+    [[ -z "$host" || "$host" == 0.0.0.0 ]] && host=127.0.0.1
+    [[ "$host" == '[::]' || "$host" == :: ]] && host=::1
+    host="${host#\[}"; host="${host%\]}"
+    valid_endpoint "$endpoint" || [[ "$endpoint" =~ ^:[0-9]{1,5}$ ]] || return 1
+    connection_tool route "$host" "$port"
+}
+
+prepare_traffic_test() {
+    local file="$1" mapping choice forwarded backend host nonce fingerprint link input first last
+    local -a mappings
+    [[ "$(basename "$file")" == iran*.toml ]] || { colorize red 'Start this test on IRAN; run the responder on KHAREJ.'; return 1; }
+    edit_load_config "$file" || return 1
+    mapfile -t mappings < <(printf '%s' "${EDIT_VALUES[ports.mapping]:-[]}" | jq -r '.[]')
+    ((${#mappings[@]})) || { colorize red 'This tunnel has no forwarded ports to test.'; return 1; }
+    echo 'Choose ONE mapping whose KHAREJ backend port is unused. Existing applications will not be stopped.'
+    for choice in "${!mappings[@]}"; do echo "$((choice+1))) ${mappings[$choice]}"; done
+    read -r -p 'Mapping (0 cancels): ' choice || return 1
+    [[ "$choice" == 0 ]] && return 0
+    [[ "$choice" =~ ^[0-9]{1,3}$ ]] && ((10#$choice >= 1 && 10#$choice <= ${#mappings[@]})) || return 1
+    mapping="${mappings[$((10#$choice-1))]}"
+    mapping="${mapping// /}"
+    local edit_mode=server
+    edit_valid_mappings "$mapping" || { colorize red 'Unsupported mapping format for this test.'; return 1; }
+    first="${mapping%%[=:]*}"
+    if [[ "$first" == *-* ]]; then
+        last="${first##*-}"; first="${first%%-*}"
+        read -r -p "Port within $first-$last [$first]: " forwarded || return 1
+        forwarded="${forwarded:-$first}"
+        [[ "$forwarded" =~ ^[0-9]{1,5}$ ]] && ((10#$forwarded >= 10#$first && 10#$forwarded <= 10#$last)) || return 1
+    else
+        forwarded="$first"
+    fi
+    backend="$forwarded"
+    [[ "$mapping" == *=* ]] && backend="${mapping##*=}"
+    [[ "$mapping" == *:* ]] && backend="${mapping##*:}"
+    host=127.0.0.1
+    [[ "$(edit_value transport.type)" == tun ]] && host="$(edit_value tun.remote_addr)" && host="${host%/*}"
+    nonce=$(random_secret)
+    fingerprint=$(pair_fingerprint) || return 1
+    link=$(encode_backhaul_link backhaul-test "$(jq -cn --arg host "$host" --argjson port "$((10#$backend))" \
+        --arg secret "$nonce" --arg pair "$fingerprint" '{v:1,kind:"traffic-test",host:$host,port:$port,secret:$secret,pair:$pair}')")
+    echo 'On KHAREJ: select the matching tunnel → Test connection → Start responder → paste this link:'
+    echo "$link"
+    echo 'Keep the test link private. The responder exits after the test or Ctrl+C.'
+    read -r -p 'When KHAREJ says Ready, press Enter here (q cancels): ' input || return 1
+    [[ "$input" == q || "$input" == Q ]] && return 0
+    local target="$(edit_value listener.bind_addr)"
+    target="${target%:*}"
+    [[ -z "$target" || "$target" == 0.0.0.0 || "$(edit_value tun.encapsulation)" == ipx ]] && target=127.0.0.1
+    [[ "$target" == '[::]' || "$target" == :: ]] && target=::1
+    target="${target#\[}"; target="${target%\]}"
+    connection_tool traffic "$target" "$forwarded" "$nonce"
+}
+
+start_traffic_responder() {
+    local file="$1" raw json host port secret pair expected_host
+    [[ "$(basename "$file")" == kharej*.toml ]] || { colorize red 'Run the responder on KHAREJ.'; return 1; }
+    read -r -p 'Paste the backhaul-test://1. link from IRAN: ' raw || return 1
+    json=$(decode_backhaul_link backhaul-test "$raw") || return 1
+    printf '%s' "$json" | jq -e '.kind == "traffic-test" and (.host | type == "string") and
+        (.port | type == "number" and . >= 1 and . <= 65535 and floor == .) and
+        (.secret | type == "string" and test("^[a-f0-9]{64}$")) and
+        (.pair | type == "string" and test("^[a-f0-9]{64}$"))' >/dev/null || return 1
+    edit_load_config "$file" || return 1
+    pair=$(pair_fingerprint) || return 1
+    [[ "$pair" == "$(printf '%s' "$json" | jq -r .pair)" ]] || { colorize red 'This test link belongs to different tunnel settings. Select the matching tunnel.'; return 1; }
+    expected_host=127.0.0.1
+    [[ "$(edit_value transport.type)" == tun ]] && expected_host="$(edit_value tun.local_addr)" && expected_host="${expected_host%/*}"
+    host=$(printf '%s' "$json" | jq -r .host)
+    [[ "$host" == "$expected_host" ]] || { colorize red 'The responder address does not match this tunnel.'; return 1; }
+    port=$(printf '%s' "$json" | jq -r .port); secret=$(printf '%s' "$json" | jq -r .secret)
+    echo "One temporary responder on $host:$port. An occupied port will be refused."
+    connection_tool responder "$host" "$port" "$secret"
+}
+
+test_connection_menu() {
+    local file="$1" choice
+    while true; do
+        colorize cyan "Test connection: $(basename "${file%.toml}")" bold
+        echo '1) Quick TCP reachability (10 sequential probes)'
+        echo '2) Real traffic test — start on IRAN (one selected mapping)'
+        echo '3) Start responder — KHAREJ (paste IRAN test link)'
+        echo '0) Back'
+        read -r -p 'Choose one test: ' choice || return 1
+        case "$choice" in
+            1) quick_connection_test "$file"; press_key ;;
+            2) prepare_traffic_test "$file"; press_key ;;
+            3) start_traffic_responder "$file"; press_key ;;
+            0) return 0 ;;
+            *) colorize red 'Invalid option.' ;;
+        esac
+    done
+}
+
+tunnel_health_check() {
+    local file="$1" name="$(basename "${1%.toml}")" cert token
+    local service="backhaul-$name.service"
+    edit_load_config "$file" || return 1
+    colorize cyan "Health check: $name" bold
+    [[ -x "$config_dir/backhaul_premium" ]] && echo 'OK: Core is executable.' || echo "FIX: Download the core or chmod +x $config_dir/backhaul_premium"
+    systemctl is-active --quiet "$service" && echo 'OK: Service is active.' || echo "FIX: Restart this tunnel and inspect its logs ($service)."
+    echo "Config: $file"
+    echo "Service: $service_dir/$service"
+    [[ -f "$file.bak" ]] && echo "Previous configuration: $file.bak"
+    if [[ "$(edit_value transport.type)" == tun ]]; then
+        [[ -e /dev/net/tun ]] || echo 'FIX: Enable /dev/net/tun for this TUN tunnel.'
+    fi
+    if [[ "$(edit_value tun.encapsulation)" == ipx ]]; then
+        echo 'IPX: verify the profile, peer IP and encryption settings on both ends; TCP port probes do not apply.'
+    else
+        token=$(edit_value security.token)
+        [[ ${#token} -ge 32 && "$token" != your_token ]] || echo 'FIX: Use a strong shared token on both ends (new setups generate one automatically).'
+    fi
+    cert=$(edit_value tls.tls_cert)
+    if [[ -n "$cert" ]]; then
+        if command -v openssl >/dev/null && openssl x509 -in "$cert" -checkend 604800 -noout >/dev/null 2>&1; then
+            echo 'OK: TLS certificate is valid for more than 7 days.'
+        else
+            echo "FIX: Check/renew the TLS certificate at $cert."
+        fi
+    fi
+    echo 'Recent selected-tunnel logs:'
+    journalctl -u "$service" -n 12 --no-pager -o cat
+    echo 'For actual connectivity, use Test connection. Service status alone does not prove a working peer.'
+    press_key
+}
+
+toggle_tunnel_service() {
+    local service="$1"
+    if systemctl is-active --quiet "$service"; then
+        systemctl stop "$service" && colorize yellow 'Tunnel stopped. It can still start at boot if enabled.'
+    else
+        if systemctl start "$service" && sleep 1 && systemctl is-active --quiet "$service"; then
+            colorize green 'Tunnel started.'
+        else
+            colorize red 'Tunnel could not start. View its service logs for details.'
+        fi
+    fi
+    press_key
+}
+
+restore_tunnel_backup() {
+    local file="$1" edit_mode confirm
+    [[ -f "$file.bak" ]] || { colorize red 'No previous configuration backup found.'; press_key; return 1; }
+    [[ "$(basename "$file")" == iran* ]] && edit_mode=server || edit_mode=client
+    edit_load_config "$file.bak" || return 1
+    edit_sections
+    echo "Restore $(edit_value transport.type) from $file.bak and restart this tunnel?"
+    read -r -p 'Restore? [y/N]: ' confirm || return 1
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+    edit_save_config "$file" "backhaul-$(basename "${file%.toml}").service"
+    press_key
 }
 
 # ============================================================================
@@ -1654,6 +2274,11 @@ tunnel_management() {
     echo "3) View service logs"
     echo "4) View service status"
     colorize cyan "5) Edit this tunnel (easy menu)"
+    echo "6) Test connection (one tunnel at a time)"
+    echo "7) Show setup link for KHAREJ"
+    echo "8) Health check and file locations"
+    echo "9) Start / stop this tunnel"
+    echo "10) Restore previous configuration"
     echo
     read -r -p "Enter your choice (0 to return): " choice
 
@@ -1663,6 +2288,11 @@ tunnel_management() {
         3) view_service_logs "$service_name" ;;
         4) view_service_status "$service_name" ;;
         5) edit_tunnel "$selected_config" ;;
+        6) test_connection_menu "$selected_config" ;;
+        7) show_setup_link "$selected_config" ;;
+        8) tunnel_health_check "$selected_config" ;;
+        9) toggle_tunnel_service "$service_name" ;;
+        10) restore_tunnel_backup "$selected_config" ;;
         0) return ;;
         *) colorize red "Invalid option!" && sleep 1 ;;
     esac
@@ -1731,21 +2361,31 @@ remove_core() {
 }
 
 update_script() {
-    return
-    DEST_DIR="/usr/bin/"
-    BACKHAUL_SCRIPT="backhaul"
-    SCRIPT_URL="http://194.9.6.93/backhaul.sh"
+    local dest_dir="/usr/bin"
+    local script_url="https://raw.githubusercontent.com/MatinDehghanian/backhaul-script/refs/heads/main/backhaul.sh"
+    local temporary
 
-    [ -f "$DEST_DIR/$BACKHAUL_SCRIPT" ] && rm "$DEST_DIR/$BACKHAUL_SCRIPT"
-
-    if curl -s -L -o "$DEST_DIR/$BACKHAUL_SCRIPT" "$SCRIPT_URL"; then
-        chmod +x "$DEST_DIR/$BACKHAUL_SCRIPT"
-        colorize yellow "Type 'backhaul' to run the script." bold
-        exit 0
-    else
-        colorize red "Download failed."
+    if ! temporary=$(mktemp "$dest_dir/.backhaul-script.XXXXXX"); then
+        colorize red "Could not prepare the script update."
+        press_key
+        return 1
     fi
-    press_key
+
+    if ! curl -fLsS --ipv4 --retry 2 --max-time 30 -o "$temporary" "$script_url" ||
+        [[ ! -s "$temporary" ]] ||
+        [[ "$(head -n 1 "$temporary")" != '#!/bin/bash' ]] ||
+        ! bash -n "$temporary" ||
+        ! chmod 755 "$temporary" ||
+        ! mv -fT -- "$temporary" "$dest_dir/backhaul"; then
+        rm -f "$temporary"
+        colorize red "Script update failed. The installed script was kept."
+        press_key
+        return 1
+    fi
+
+    colorize green "Script updated from GitHub." bold
+    colorize yellow "Type 'backhaul' to run the updated script." bold
+    exit 0
 }
 
 configure_tunnel() {
@@ -1759,12 +2399,14 @@ configure_tunnel() {
     echo ""
     colorize green "1) Configure IRAN (Server)" bold
     colorize magenta "2) Configure KHAREJ (Client)" bold
+    colorize cyan "3) Setup KHAREJ from an IRAN setup link" bold
     echo ""
     read -r -p "Enter your choice: " configure_choice
 
     case "$configure_choice" in
         1) configure_server "server" ;;
         2) configure_server "client" ;;
+        3) setup_from_link ;;
         *) colorize red "Invalid option!" && sleep 1 ;;
     esac
 }
