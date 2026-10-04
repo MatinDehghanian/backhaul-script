@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define script version
-SCRIPT_VERSION="v1.1.0"
+SCRIPT_VERSION="v1.2.0"
 
 if ((BASH_VERSINFO[0] < 4)); then
     echo "This script requires Bash 4 or newer."
@@ -1881,6 +1881,866 @@ except (OSError, ValueError) as exc:
 PY
 }
 
+# Sequential, two-server transport comparison. Embedded for raw-script installs.
+transport_comparison_tool() {
+    command -v python3 >/dev/null || {
+        colorize red 'Transport comparison requires Python 3.9+. Install python3 first.' >&2
+        return 1
+    }
+    python3 - 3< <(printf '%s\0' "$config_dir" "$@") <<'PY_COMPARE'
+import base64
+import contextlib
+import fcntl
+import hashlib
+import hmac
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import signal
+import socket
+import statistics
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+CASES = ['tcp', 'tcpmux', 'xtcpmux', 'ws', 'wss', 'wsmux', 'wssmux', 'xwsmux', 'anytls',
+         'tun/tcp'] + ['tun/ipx/' + p for p in ('icmp', 'ipip', 'udp', 'tcp', 'gre', 'bip')]
+PLANS = {'quick': (10, .5), 'stability': (60, 1)}
+BULK = 8 * 1024 * 1024
+CONNECT_WAIT = 30
+JOIN_WAIT = 600
+ACK_WAIT = 30
+MAX_MESSAGE = 65536
+SCHEME = 'backhaul-compare://1.'
+
+def emit(message):
+    print(message, flush=True)
+
+def exact(sock, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError('connection closed during transfer')
+        data.extend(chunk)
+    return bytes(data)
+
+def listener(host, port):
+    family = socket.AF_INET6 if ':' in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        sock.bind((host, port))
+        sock.listen(8)
+        sock.settimeout(.5)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()
+
+def derived(secret, label):
+    return hmac.new(bytes.fromhex(secret), label.encode(), hashlib.sha256).hexdigest()
+
+def valid_host(host):
+    if not isinstance(host, str) or not host or len(host) > 253:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return bool(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', host))
+
+def validate_link(value):
+    required = {'v', 'host', 'coord', 'port', 'health', 'secret', 'block', 'mode', 'until'}
+    if not isinstance(value, dict) or set(value) != required or type(value['v']) is not int or value['v'] != 1:
+        raise ValueError('invalid comparison link schema')
+    if not valid_host(value['host']):
+        raise ValueError('invalid IRAN address')
+    for key in ('coord', 'port', 'health'):
+        if type(value[key]) is not int or not 1 <= value[key] <= 65535:
+            raise ValueError('invalid test port')
+    if len({value['coord'], value['port'], value['health']}) != 3 or value['mode'] not in PLANS:
+        raise ValueError('invalid test settings')
+    if not isinstance(value['secret'], str) or not re.fullmatch('[a-f0-9]{64}', value['secret']):
+        raise ValueError('invalid test secret')
+    block = ipaddress.ip_network(value['block'])
+    if block.version != 4 or block.prefixlen != 30 or not block.subnet_of(ipaddress.ip_network('198.18.0.0/15')):
+        raise ValueError('invalid temporary TUN subnet')
+    if type(value['until']) is not int or not time.time() < value['until'] <= time.time() + 3700:
+        raise ValueError('comparison link expired or invalid expiry')
+    return value
+
+def encode_link(value):
+    return SCHEME + base64.urlsafe_b64encode(canonical(value)).decode().rstrip('=')
+
+def decode_link(raw):
+    raw = raw.strip().strip('\"\'')
+    if not raw.startswith(SCHEME) or len(raw) > 4096:
+        raise ValueError('paste the complete backhaul-compare://1. link from IRAN')
+    payload = raw[len(SCHEME):]
+    if not re.fullmatch('[A-Za-z0-9_-]+', payload):
+        raise ValueError('invalid comparison link encoding')
+    return validate_link(json.loads(base64.b64decode(payload + '=' * (-len(payload) % 4), altchars=b'-_', validate=True)))
+
+def run_command(args, **kwargs):
+    return subprocess.run(args, capture_output=True, text=True, timeout=15, **kwargs)
+
+def tun_problem(block):
+    if os.geteuid() != 0 or not Path('/dev/net/tun').exists() or not shutil.which('ip'):
+        return 'TUN needs root, /dev/net/tun and iproute2'
+    try:
+        routes = run_command(['ip', '-j', '-4', 'route', 'show', 'table', 'all'])
+        if routes.returncode:
+            return 'could not inspect local routes for the temporary TUN subnet'
+        for route in json.loads(routes.stdout):
+            destination = route.get('dst', 'default')
+            if destination != 'default' and ipaddress.ip_network(destination, strict=False).overlaps(ipaddress.ip_network(block)):
+                return 'temporary TUN subnet overlaps a local route'
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 'could not inspect local TUN prerequisites'
+    return ''
+
+def pick_block():
+    for _ in range(64):
+        block = f'198.18.{secrets.randbelow(256)}.{4*secrets.randbelow(64)}/30'
+        problem = tun_problem(block)
+        if not problem or 'overlaps' not in problem:
+            return block
+    # Keep stream tests available even if every candidate subnet overlaps.
+    # tun_problem reports the overlap and skips only the TUN cases.
+    return block
+
+def network_info(peer, local):
+    info = {'local': local, 'peer': peer, 'interface': '', 'ipx_error': ''}
+    try:
+        if ipaddress.ip_address(peer).version != 4 or ipaddress.ip_address(local).version != 4:
+            raise ValueError('IPX tests need an IPv4 path between the servers')
+        route = run_command(['ip', '-j', '-4', 'route', 'get', peer])
+        info['interface'] = json.loads(route.stdout)[0]['dev']
+        if route.returncode or not re.fullmatch('[A-Za-z0-9_.:-]{1,15}', info['interface']):
+            raise ValueError('could not find the IPv4 network interface')
+    except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError) as exc:
+        info['ipx_error'] = str(exc) if isinstance(exc, ValueError) else 'IPX needs a usable IPv4 interface and iproute2'
+    return info
+
+class PausedServices:
+    """Remember only running managed services; always restore them on exit."""
+    def __init__(self, binary):
+        self.binary = os.path.realpath(binary)
+        self.units = []
+
+    def other_cores(self):
+        for path in Path('/proc').glob('[0-9]*/exe'):
+            try:
+                executable = os.readlink(path).removesuffix(' (deleted)')
+                if executable == self.binary or Path(executable).name in ('backhaul', 'backhaul_premium'):
+                    return True
+            except OSError:
+                pass
+        return False
+
+    def __enter__(self):
+        try:
+            result = run_command(['systemctl', 'list-units', '--type=service', '--state=active,activating,reloading',
+                                  '--plain', '--no-legend', 'backhaul-*.service'])
+            if result.returncode:
+                raise ValueError('could not list running Backhaul services; no test engine was started')
+            self.units = [line.split()[0] for line in result.stdout.splitlines() if line.split() and
+                          re.fullmatch(r'backhaul-(?:iran|kharej)[0-9]+\.service', line.split()[0])]
+            for unit in self.units:
+                emit('Temporarily pausing ' + unit)
+                if run_command(['systemctl', 'stop', unit]).returncode:
+                    raise ValueError('could not pause ' + unit)
+            if self.other_cores():
+                raise ValueError('another Backhaul core is running outside the managed services; stop it before comparing')
+            return self
+        except BaseException:
+            self.restore()
+            raise
+
+    def restore(self):
+        units, self.units = self.units, []
+        failed = []
+        for unit in units:
+            try:
+                started = run_command(['systemctl', 'start', unit])
+                active = run_command(['systemctl', 'is-active', '--quiet', unit])
+                if started.returncode or active.returncode:
+                    failed.append(unit)
+                else:
+                    emit('Restored ' + unit)
+            except (OSError, subprocess.SubprocessError):
+                failed.append(unit)
+        if failed:
+            emit('RESTORE FAILED: run systemctl start ' + ' '.join(failed) + ' and check their logs.')
+        return failed
+
+    def __exit__(self, exc_type, *_):
+        if self.restore() and exc_type is None:
+            raise ValueError('some paused services could not be restored; use the recovery command above')
+
+def render_config(side, case, link, entry, backend, interface, net, cert, key):
+    parts = case.split('/')
+    tun = parts[0] == 'tun'
+    ipx = tun and parts[1] == 'ipx'
+    section = {}
+    address = '[' + link['host'] + ']' if ':' in link['host'] else link['host']
+    if not ipx:
+        if side == 'iran':
+            section['listener'] = {'bind_addr': f'0.0.0.0:{link["port"]}' if ':' not in link['host'] else f'[::]:{link["port"]}'}
+        else:
+            section['dialer'] = {'remote_addr': f'{address}:{link["port"]}', 'dial_timeout': 5, 'retry_interval': 1}
+    section['transport'] = {'type': parts[0], 'heartbeat_interval': 10, 'heartbeat_timeout': 25}
+    if not ipx:
+        section['transport'].update(nodelay=True, keepalive_period=40)
+    if not tun and side == 'kharej':
+        section['transport']['connection_pool'] = 8
+    if side == 'iran' and not tun:
+        section['transport']['proxy_protocol'] = False
+    if tun:
+        subnet = ipaddress.ip_network(link['block'])
+        local, remote = (str(subnet[1]), str(subnet[2])) if side == 'iran' else (str(subnet[2]), str(subnet[1]))
+        section['tun'] = {'encapsulation': parts[1], 'name': interface, 'local_addr': local + '/30',
+                          'remote_addr': remote + '/30', 'health_port': link['health'], 'mtu': 1320 if ipx else 1500}
+    if ipx:
+        section['ipx'] = {'mode': 'server' if side == 'iran' else 'client', 'profile': parts[2],
+                          'listen_ip': net['local'], 'dst_ip': net['peer'], 'interface': net['interface']}
+        if parts[2] == 'icmp':
+            section['ipx'].update(icmp_type=0, icmp_code=0)
+        psk = base64.b64encode(bytes.fromhex(derived(link['secret'], 'ipx-psk'))).decode()
+        section['security'] = {'enable_encryption': True, 'algorithm': 'aes-256-gcm', 'psk': psk, 'kdf_iterations': 100000}
+    else:
+        section['security'] = {'token': derived(link['secret'], case)}
+    if case.endswith('mux'):
+        section['mux'] = {'mux_version': 2, 'mux_framesize': 32768, 'mux_recievebuffer': 4194304,
+                          'mux_streambuffer': 2097152, 'mux_concurrency': 8}
+    if case in ('wss', 'wssmux', 'anytls'):
+        section['tls'] = {'sni': 'backhaul.com'}
+        if side == 'iran':
+            section['tls'].update(tls_cert=str(cert), tls_key=str(key))
+    # Diagnostic engines must not tune global kernel settings or add iptables forwarding rules.
+    section['tuning'] = {'auto_tuning': False, 'workers': 0, 'channel_size': 10000 if tun else 4096,
+                         'so_rcvbuf': 0, 'so_sndbuf': 0}
+    if not ipx:
+        section['tuning']['tcp_mss'] = 0
+    if not tun:
+        section['tuning'].update(buffer_profile='balanced', read_timeout=120)
+    section['logging'] = {'log_level': 'warn'}
+    if side == 'iran':
+        section['ports'] = {'mapping': [f'{entry}={backend}']}
+        if tun:
+            section['ports']['forwarder'] = 'backhaul'
+    return '\n\n'.join('[' + name + ']\n' + '\n'.join(k + ' = ' + json.dumps(v) for k, v in fields.items())
+                        for name, fields in section.items()) + '\n'
+
+class Engine:
+    def __init__(self, binary, directory, interface):
+        self.binary, self.directory, self.interface = binary, Path(directory), interface
+        self.process = None
+        self.log = None
+        self.owns_interface = False
+
+    def start(self, config, tun):
+        if self.process is not None:
+            raise ValueError('previous test engine has not been stopped')
+        if tun and run_command(['ip', 'link', 'show', 'dev', self.interface]).returncode == 0:
+            raise ValueError('temporary TUN interface already exists; refusing to reuse it')
+        path = self.directory / 'test.toml'
+        path.write_text(config)
+        path.chmod(0o600)
+        self.log = (self.directory / 'core.log').open('w')
+        self.process = subprocess.Popen([self.binary, '-c', str(path)], cwd=self.directory,
+                                        stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+        self.owns_interface = tun
+        time.sleep(.3)
+        self.check()
+
+    def check(self):
+        if self.process is not None and self.process.poll() is not None:
+            raise ValueError(f'Backhaul core exited with status {self.process.returncode}')
+
+    def stop(self):
+        if self.process is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.process.pid, signal.SIGTERM)
+            if self.process.poll() is None:
+                try:
+                    self.process.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                    self.process.wait(timeout=4)
+            # Also remove child helpers if the core exited before cleanup.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.process.pid, signal.SIGKILL)
+            self.process = None
+        if self.log is not None:
+            self.log.close()
+            self.log = None
+        if self.owns_interface:
+            if run_command(['ip', 'link', 'show', 'dev', self.interface]).returncode == 0:
+                if run_command(['ip', 'link', 'delete', 'dev', self.interface]).returncode:
+                    raise ValueError('could not remove temporary TUN interface ' + self.interface)
+            self.owns_interface = False
+
+class Echo:
+    def __init__(self, host, port, secret):
+        self.sock = listener(host, port)
+        self.port = self.sock.getsockname()[1]
+        self.secret = secret
+        self.stopped = threading.Event()
+        self.clients = set()
+        self.mutex = threading.Lock()
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        while not self.stopped.is_set():
+            try:
+                client, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with self.mutex:
+                if len(self.clients) >= 8:
+                    client.close()
+                    continue
+                self.clients.add(client)
+            threading.Thread(target=self.handle, args=(client,), daemon=True).start()
+
+    def handle(self, client):
+        try:
+            with client:
+                client.settimeout(10)
+                hello = b'BACKHAUL-COMPARE-1 ' + self.secret.encode() + b'\n'
+                if exact(client, len(hello)) != hello:
+                    return
+                client.sendall(hello)
+                while not self.stopped.is_set():
+                    op = exact(client, 1)
+                    size = struct.unpack('!I', exact(client, 4))[0]
+                    if size > BULK:
+                        return
+                    if op == b'Q' and size == 0:
+                        return
+                    elif op == b'E' and size == 64:
+                        client.sendall(exact(client, size))
+                    elif op == b'U' and size == BULK:
+                        client.sendall(hashlib.sha256(exact(client, size)).digest())
+                    elif op == b'D' and size == BULK:
+                        data = os.urandom(size)
+                        client.sendall(data + hashlib.sha256(data).digest())
+                    else:
+                        return
+        except (OSError, ValueError):
+            pass
+        finally:
+            with self.mutex:
+                self.clients.discard(client)
+
+    def close(self):
+        self.stopped.set()
+        self.sock.close()
+        with self.mutex:
+            for client in self.clients:
+                with contextlib.suppress(OSError):
+                    client.shutdown(socket.SHUT_RDWR)
+        self.thread.join(timeout=2)
+
+def measure(case, port, link, engine):
+    count, interval = PLANS[link['mode']]
+    row = {'transport': case, 'status': 'DOWN', 'ok': 0, 'total': count, 'detail': ''}
+    times = []
+    deadline = time.monotonic() + CONNECT_WAIT
+    hello = b'BACKHAUL-COMPARE-1 ' + derived(link['secret'], 'echo').encode() + b'\n'
+    sock = None
+    try:
+        while time.monotonic() < deadline:
+            engine.check()
+            try:
+                sock = socket.create_connection(('127.0.0.1', port), timeout=2)
+                sock.settimeout(5)
+                sock.sendall(hello)
+                if exact(sock, len(hello)) != hello:
+                    raise ValueError('wrong echo responder')
+                break
+            except OSError:
+                if sock:
+                    sock.close()
+                    sock = None
+                time.sleep(.3)
+        if sock is None:
+            raise TimeoutError('no authenticated traffic within 30 seconds')
+        with sock:
+            for n in range(count):
+                engine.check()
+                data = os.urandom(64)
+                started = time.monotonic()
+                sock.sendall(b'E' + struct.pack('!I', len(data)) + data)
+                if exact(sock, len(data)) != data:
+                    raise ValueError('ping echo bytes did not match')
+                elapsed = time.monotonic() - started
+                times.append(elapsed * 1000)
+                row['ok'] = len(times)
+                time.sleep(max(0, interval - elapsed))
+            sock.settimeout(30)
+            data = os.urandom(BULK)
+            digest = hashlib.sha256(data).digest()
+            started = time.monotonic()
+            sock.sendall(b'U' + struct.pack('!I', BULK) + data)
+            if exact(sock, 32) != digest:
+                raise ValueError('upload payload verification failed')
+            row['upload'] = BULK * 8 / max(time.monotonic() - started, .000001) / 1e6
+            started = time.monotonic()
+            sock.sendall(b'D' + struct.pack('!I', BULK))
+            data = exact(sock, BULK)
+            digest = exact(sock, 32)
+            elapsed = time.monotonic() - started
+            if hashlib.sha256(data).digest() != digest:
+                raise ValueError('download payload verification failed')
+            row['download'] = BULK * 8 / max(elapsed, .000001) / 1e6
+            sock.sendall(b'Q' + struct.pack('!I', 0))
+        row['status'] = 'AVAILABLE'
+    except (OSError, ValueError) as exc:
+        row['status'] = 'UNSTABLE' if times else 'DOWN'
+        row['detail'] = str(exc)
+    finally:
+        if sock:
+            sock.close()
+        if times:
+            row.update(ping=statistics.mean(times), jitter=statistics.pstdev(times))
+    return row
+
+def signed(secret, payload):
+    return {'payload': payload, 'mac': derived(secret, canonical(payload).decode())}
+
+def verified(secret, envelope):
+    if not isinstance(envelope, dict) or set(envelope) != {'payload', 'mac'} or not isinstance(envelope['mac'], str):
+        raise ValueError('invalid coordinator message')
+    if not hmac.compare_digest(signed(secret, envelope['payload'])['mac'], envelope['mac']):
+        raise ValueError('coordinator authentication failed')
+    return envelope['payload']
+
+def read_json(sock):
+    with sock.makefile('rb') as stream:
+        raw = stream.readline(MAX_MESSAGE + 1)
+    if len(raw) > MAX_MESSAGE or not raw.endswith(b'\n'):
+        raise ValueError('oversized or incomplete coordinator message')
+    return json.loads(raw)
+
+def rpc(link, client_id, action, **data):
+    nonce = secrets.token_hex(16)
+    body = {'nonce': nonce, 'time': int(time.time()), 'client': client_id, 'action': action, **data}
+    with socket.create_connection((link['host'], link['coord']), timeout=5) as sock:
+        sock.settimeout(5)
+        local, peer = sock.getsockname()[0], sock.getpeername()[0]
+        sock.sendall(canonical(signed(link['secret'], body)) + b'\n')
+        response = verified(link['secret'], read_json(sock))
+    if not isinstance(response, dict) or response.get('nonce') != nonce:
+        raise ValueError('invalid coordinator response')
+    if 'error' in response:
+        raise ValueError(response['error'])
+    return response['state'], local, peer
+
+class Coordinator:
+    def __init__(self, link, sock, entry):
+        self.link, self.sock = link, sock
+        self.mutex = threading.Lock()
+        self.state = {'phase': 'waiting', 'index': -1, 'results': [], 'entry': entry, 'peer': None}
+        self.joined = threading.Event()
+        self.started = threading.Event()
+        self.stopped = threading.Event()
+        self.fetched = threading.Event()
+        self.closed = threading.Event()
+        self.client_id = None
+        self.seen = {}
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def publish(self, **values):
+        with self.mutex:
+            if values.get('phase') == 'start':
+                self.started.clear()
+                self.stopped.clear()
+            self.state.update(values)
+
+    def serve(self):
+        while not self.closed.is_set():
+            try:
+                conn, peer = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(3)
+                try:
+                    request = verified(self.link['secret'], read_json(conn))
+                    response = self.handle(request, peer[0], conn.getsockname()[0])
+                    conn.sendall(canonical(signed(self.link['secret'], response)) + b'\n')
+                except (OSError, ValueError, TypeError, KeyError):
+                    continue
+
+    def handle(self, request, peer, local):
+        now = time.time()
+        if not isinstance(request, dict) or type(request.get('time')) is not int or abs(request['time'] - now) > 120:
+            raise ValueError('invalid request time; check clocks on both servers')
+        nonce, client = request.get('nonce'), request.get('client')
+        if not isinstance(nonce, str) or not re.fullmatch('[a-f0-9]{32}', nonce) or not isinstance(client, str) or not re.fullmatch('[a-f0-9]{32}', client):
+            raise ValueError('invalid coordinator request')
+        with self.mutex:
+            self.seen = {key: stamp for key, stamp in self.seen.items() if now - stamp < 120}
+            if nonce in self.seen:
+                raise ValueError('replayed coordinator request')
+            self.seen[nonce] = now
+            if self.client_id is not None and self.client_id != client:
+                return {'nonce': nonce, 'error': 'another KHAREJ is already paired with this test'}
+            action = request.get('action')
+            if action == 'join' and self.client_id is None:
+                backend = request.get('backend')
+                problem, ipx_error = request.get('tun_error'), request.get('ipx_error')
+                if type(backend) is not int or not 1 <= backend <= 65535 or not isinstance(problem, str) or len(problem) > 200 or not isinstance(ipx_error, str) or len(ipx_error) > 200:
+                    raise ValueError('invalid KHAREJ capabilities')
+                self.client_id = client
+                self.state['peer'] = {'backend': backend, 'tun_error': problem, 'client_ipx_error': ipx_error,
+                                      'net': network_info(peer, local)}
+                self.joined.set()
+            elif action == 'started' and request.get('index') == self.state['index'] and self.state['phase'] == 'start':
+                error = request.get('error', '')
+                if not isinstance(error, str) or len(error) > 200:
+                    raise ValueError('invalid engine status')
+                self.state['client_error'] = error
+                self.started.set()
+            elif action == 'stopped' and request.get('index') == self.state['index'] and self.state['phase'] == 'stop':
+                self.stopped.set()
+            elif action == 'finish' and self.state['phase'] == 'finished':
+                self.fetched.set()
+            elif action == 'cancel':
+                self.state['phase'] = 'cancelled'
+            elif action in ('started', 'stopped'):
+                # Replies may cross the next state transition. Old acknowledgements
+                # are harmless and must never acknowledge a different test case.
+                pass
+            elif action not in ('poll', 'join'):
+                raise ValueError('unexpected coordinator action')
+            return {'nonce': nonce, 'state': json.loads(json.dumps(self.state))}
+
+    def close(self):
+        self.closed.set()
+        self.sock.close()
+        self.thread.join(timeout=4)
+
+def wait_for(event, seconds, coordinator):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if coordinator.state['phase'] == 'cancelled':
+            raise ValueError('KHAREJ cancelled the comparison')
+        if event.wait(.2):
+            return
+    raise TimeoutError('KHAREJ did not acknowledge; comparison stopped to prevent overlapping engines')
+
+def print_row(row):
+    def metric(name):
+        return f'{row[name]:.1f}' if name in row else '-'
+    emit(f'{row["transport"]:<16} {row["status"]:<10} {metric("ping"):>9} {metric("jitter"):>9} '
+         f'{metric("upload"):>10} {metric("download"):>10} {row.get("ok", 0):>2}/{row.get("total", 0):<2}')
+    if row.get('detail'):
+        emit('  ' + ''.join(c if c.isprintable() else ' ' for c in row['detail'])[:200])
+
+def report(rows, directory, link):
+    emit('\nTransport        Result       Ping ms Jitter ms  Up Mbit/s Down Mbit/s Echoes')
+    for row in rows:
+        print_row(row)
+    good = [r for r in rows if r['status'] == 'AVAILABLE']
+    if good:
+        best = max(good, key=lambda r: min(r['upload'], r['download']))
+        emit('Fastest verified transport in this test: ' + best['transport'])
+    else:
+        emit('No transport completed all ping and speed checks.')
+    emit('Ping is application echo round-trip latency through the tunnel. Speeds use verified 8 MiB payloads.')
+    output = Path(directory) / 'transport-test-results.json'
+    fd, temporary = tempfile.mkstemp(prefix='.comparison-report-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump({'time': int(time.time()), 'host': link['host'], 'mode': link['mode'], 'results': rows}, stream, indent=2)
+        os.replace(temporary, output)
+        emit('Saved report: ' + str(output))
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+def server(directory, host, coord_port, tunnel_port, mode):
+    if not valid_host(host) or mode not in PLANS or not 1 <= coord_port <= 65535 or not 1 <= tunnel_port <= 65535 or coord_port == tunnel_port:
+        raise ValueError('invalid host, ports or test plan')
+    family_host = '::' if ':' in host else '0.0.0.0'
+    # Reserve all port choices together, refusing occupied ports before any pause.
+    coord_socket = listener(family_host, coord_port)
+    try:
+        with listener(family_host, tunnel_port), listener('127.0.0.1', 0) as entry_reservation, listener('0.0.0.0', 0) as health_reservation:
+            entry = entry_reservation.getsockname()[1]
+            health = health_reservation.getsockname()[1]
+        link = validate_link({'v': 1, 'host': host, 'coord': coord_port, 'port': tunnel_port,
+                              'health': health, 'secret': secrets.token_hex(32), 'block': pick_block(), 'mode': mode,
+                              'until': int(time.time()) + 3600})
+        coordinator = Coordinator(link, coord_socket, entry)
+    except BaseException:
+        coord_socket.close()
+        raise
+    binary = str(Path(directory) / 'backhaul_premium')
+    try:
+        emit('IRAN test link (keep private):\n' + encode_link(link))
+        emit(f'On KHAREJ: main menu → 7 → KHAREJ → paste the link. Allow TCP {coord_port} and {tunnel_port} to IRAN.')
+        emit('Waiting up to 10 minutes for KHAREJ. Existing services are paused only after it joins.')
+        wait_for(coordinator.joined, JOIN_WAIT, coordinator)
+        peer = coordinator.state['peer']
+        with tempfile.TemporaryDirectory(prefix='.transport-compare-', dir=directory) as temporary, PausedServices(binary) as paused:
+            engine = Engine(binary, temporary, 'bhct' + secrets.token_hex(4))
+            cert, key = Path(temporary) / 'cert.crt', Path(temporary) / 'key.key'
+            tls_error = ''
+            try:
+                result = run_command(['openssl', 'req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+                                      '-nodes', '-x509', '-days', '1', '-sha256', '-keyout', str(key), '-out', str(cert), '-subj', '/CN=backhaul.com'])
+                if result.returncode:
+                    tls_error = 'could not create temporary TLS certificate'
+            except (OSError, subprocess.SubprocessError):
+                tls_error = 'TLS tests need openssl'
+            rows = []
+            emit('Testing one transport at a time. Ctrl+C cancels and restores paused services.')
+            try:
+                for index, case in enumerate(CASES):
+                    if coordinator.state['phase'] == 'cancelled':
+                        raise ValueError('KHAREJ cancelled the comparison')
+                    problem = ''
+                    if case.startswith('tun/'):
+                        problem = tun_problem(link['block']) or peer['tun_error']
+                        if '/ipx/' in case:
+                            problem = problem or peer['net']['ipx_error'] or peer.get('client_ipx_error', '')
+                    if case in ('wss', 'wssmux', 'anytls'):
+                        problem = tls_error
+                    emit(f'\n[{index+1}/{len(CASES)}] {case}')
+                    if problem:
+                        row = {'transport': case, 'status': 'SKIPPED', 'detail': problem}
+                    else:
+                        if paused.other_cores():
+                            raise ValueError('another Backhaul core started during the comparison; stopping')
+                        config = render_config('iran', case, link, entry, peer['backend'], engine.interface, peer['net'], cert, key)
+                        try:
+                            engine.start(config, case.startswith('tun/'))
+                            coordinator.publish(phase='start', index=index, client_error='')
+                            wait_for(coordinator.started, ACK_WAIT, coordinator)
+                            if coordinator.state['client_error']:
+                                row = {'transport': case, 'status': 'ERROR', 'detail': coordinator.state['client_error']}
+                            else:
+                                row = measure(case, entry, link, engine)
+                        except ValueError as exc:
+                            row = {'transport': case, 'status': 'ERROR', 'detail': str(exc)}
+                        finally:
+                            engine.stop()
+                        # KHAREJ must finish stopping its core before the next IRAN core starts.
+                        if coordinator.state['phase'] == 'start':
+                            coordinator.publish(phase='stop')
+                            wait_for(coordinator.stopped, ACK_WAIT, coordinator)
+                    rows.append(row)
+                    coordinator.publish(results=list(rows))
+                    print_row(row)
+                coordinator.publish(phase='finished')
+                report(rows, directory, link)
+                wait_for(coordinator.fetched, ACK_WAIT, coordinator)
+            finally:
+                engine.stop()
+    finally:
+        coordinator.publish(phase='cancelled')
+        coordinator.close()
+
+def client(directory, raw):
+    link = decode_link(raw)
+    client_id = secrets.token_hex(16)
+    echo_secret = derived(link['secret'], 'echo')
+    binary = str(Path(directory) / 'backhaul_premium')
+    # Probe the coordinator before pausing services; a stale link must not interrupt a running tunnel.
+    state, local, peer = rpc(link, client_id, 'poll')
+    if state['phase'] != 'waiting':
+        raise ValueError('this test has already started or finished; generate a new IRAN link')
+    net = network_info(peer, local)
+    with tempfile.TemporaryDirectory(prefix='.transport-compare-', dir=directory) as temporary, PausedServices(binary) as paused:
+        engine = Engine(binary, temporary, 'bhct' + secrets.token_hex(4))
+        echo = Echo('127.0.0.1', 0, echo_secret)
+        tun_echo = None
+        completed = False
+        try:
+            problem = tun_problem(link['block'])
+            if not problem:
+                try:
+                    with listener('0.0.0.0', link['health']):
+                        pass
+                except OSError:
+                    problem = 'temporary TUN health port is occupied on KHAREJ'
+            state, _, _ = rpc(link, client_id, 'join', backend=echo.port, tun_error=problem, ipx_error=net['ipx_error'])
+            emit('Joined IRAN. One temporary test tunnel at a time; Ctrl+C cancels and restores services.')
+            active_index, shown = -1, 0
+            while time.time() < link['until']:
+                phase, index = state['phase'], state['index']
+                for row in state['results'][shown:]:
+                    print_row(row)
+                shown = len(state['results'])
+                if phase == 'finished':
+                    report(state['results'], directory, link)
+                    rpc(link, client_id, 'finish')
+                    completed = True
+                    return
+                if phase == 'cancelled':
+                    raise ValueError('IRAN cancelled the comparison')
+                if phase == 'start' and index != active_index:
+                    if type(index) is not int or not 0 <= index < len(CASES):
+                        raise ValueError('invalid transport index from IRAN')
+                    if engine.process is not None:
+                        raise ValueError('IRAN requested a second test engine before stopping the first')
+                    case = CASES[index]
+                    active_index = index
+                    error = ''
+                    try:
+                        if paused.other_cores():
+                            raise ValueError('another Backhaul core is running here')
+                        if '/ipx/' in case and net['ipx_error']:
+                            raise ValueError(net['ipx_error'])
+                        config = render_config('kharej', case, link, state['entry'], echo.port, engine.interface, net, '', '')
+                        engine.start(config, case.startswith('tun/'))
+                        if case.startswith('tun/'):
+                            target = str(ipaddress.ip_network(link['block'])[2])
+                            deadline = time.monotonic() + 5
+                            while True:
+                                try:
+                                    tun_echo = Echo(target, echo.port, echo_secret)
+                                    break
+                                except OSError:
+                                    engine.check()
+                                    if time.monotonic() >= deadline:
+                                        raise ValueError('temporary TUN address did not become available')
+                                    time.sleep(.2)
+                        emit(f'[{index+1}/{len(CASES)}] Testing {case}')
+                    except (OSError, ValueError) as exc:
+                        error = str(exc)[:200]
+                    state, _, _ = rpc(link, client_id, 'started', index=index, error=error)
+                elif phase == 'stop':
+                    if tun_echo:
+                        tun_echo.close()
+                        tun_echo = None
+                    engine.stop()
+                    state, _, _ = rpc(link, client_id, 'stopped', index=index)
+                else:
+                    time.sleep(.3)
+                    state, _, _ = rpc(link, client_id, 'poll')
+            raise TimeoutError('comparison expired')
+        finally:
+            # Best effort informs IRAN; local cleanup/restoration never depends on a remote reply.
+            if not completed:
+                with contextlib.suppress(OSError, ValueError):
+                    rpc(link, client_id, 'cancel')
+            try:
+                if tun_echo:
+                    tun_echo.close()
+                echo.close()
+            finally:
+                engine.stop()
+
+def main():
+    values = os.fdopen(3, 'rb').read().split(b'\0')[:-1]
+    directory, action, *args = [value.decode() for value in values]
+    if sys.version_info < (3, 9):
+        raise ValueError('transport comparison requires Python 3.9 or newer')
+    if not os.access(Path(directory) / 'backhaul_premium', os.X_OK):
+        raise ValueError('install the Backhaul core first')
+    with open(Path(directory) / '.connection-test.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('another connection test is running here; finish or cancel it first')
+        if action == 'iran':
+            host, coord, port, mode = args
+            server(directory, host, int(coord), int(port), mode)
+        elif action == 'kharej':
+            client(directory, args[0])
+        else:
+            raise ValueError('unknown comparison role')
+
+if __name__ == '__main__':
+    def cancel(_signal, _frame):
+        # Let cleanup finish even if Ctrl+C is pressed again during restoration.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, cancel)
+    signal.signal(signal.SIGTERM, cancel)
+    try:
+        main()
+    except KeyboardInterrupt:
+        emit('\nComparison cancelled. Temporary engines cleaned up; paused services restored where possible.')
+        sys.exit(130)
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as exc:
+        emit('Comparison stopped: ' + str(exc))
+        sys.exit(1)
+PY_COMPARE
+}
+
+test_all_transports_menu() {
+    local role host coord port plan raw confirm
+    [[ -x "$config_dir/backhaul_premium" ]] || { colorize red 'Install Backhaul Core first.'; press_key; return 1; }
+    colorize cyan 'Compare all transports — ping and speed (sequential)' bold
+    echo '1) IRAN — start here and get a test link'
+    echo '2) KHAREJ — paste the IRAN test link'
+    echo '0) Back'
+    read -r -p 'This server is: ' role || return 1
+    case "$role" in
+        0) return 0 ;;
+        1)
+            prompt_with_default 'IRAN public IP or hostname' "$SERVER_IP" host
+            prompt_with_default 'Test control TCP port' '54000' coord
+            prompt_with_default 'Test tunnel TCP port (reused for every transport)' '54001' port
+            [[ "$coord" =~ ^[0-9]{1,5}$ && "$port" =~ ^[0-9]{1,5}$ ]] &&
+                ((10#$coord >= 1 && 10#$coord <= 65535 && 10#$port >= 1 && 10#$port <= 65535 && 10#$coord != 10#$port)) || {
+                    colorize red 'Choose two different ports between 1 and 65535.'; press_key; return 1;
+                }
+            echo '1) Quick — 10 echoes over 5 seconds per working transport'
+            echo '2) Stability — 60 echoes over 60 seconds per working transport'
+            read -r -p 'Test plan [1]: ' plan || return 1
+            case "${plan:-1}" in
+                1) plan=quick ;;
+                2) plan=stability ;;
+                *) colorize red 'Invalid plan.'; return 1 ;;
+            esac
+            echo "Allow TCP $coord and $port from KHAREJ to IRAN before starting. IPX also depends on its raw protocol path."
+            ;;
+        2)
+            read -r -p 'Paste the backhaul-compare://1. link from IRAN: ' raw || return 1
+            ;;
+        *) colorize red 'Invalid role.'; return 1 ;;
+    esac
+    colorize yellow 'This comparison temporarily pauses running managed Backhaul tunnels on this server.'
+    echo 'Their configurations and boot settings are preserved. Paused services are restored after the test or Ctrl+C.'
+    echo 'The test starts only one temporary Backhaul core at a time. Unmanaged cores must be stopped first.'
+    read -r -p 'Continue with the temporary pause? [y/N]: ' confirm || return 1
+    [[ "$confirm" == y || "$confirm" == Y ]] || return 0
+    if [[ "$role" == 1 ]]; then
+        transport_comparison_tool iran "$host" "$((10#$coord))" "$((10#$port))" "$plan"
+    else
+        transport_comparison_tool kharej "$raw"
+    fi
+    press_key
+}
+
 pair_fingerprint() {
     local id separator="" body
     body=$({
@@ -2428,12 +3288,13 @@ display_menu() {
     echo " 4. Update Backhaul Core"
     echo " 5. Update script"
     echo " 6. Remove Backhaul Core"
+    colorize cyan " 7. Test all transports (ping and speed)" bold
     echo " 0. Exit"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 read_option() {
-    read -r -p "Enter your choice [0-6]: " choice
+    read -r -p "Enter your choice [0-7]: " choice
     case $choice in
         1) configure_tunnel ;;
         2) tunnel_management ;;
@@ -2441,6 +3302,7 @@ read_option() {
         4) download_backhaul "menu" ;;
         5) update_script ;;
         6) remove_core ;;
+        7) test_all_transports_menu ;;
         0) exit 0 ;;
         *) colorize red "Invalid option!" && sleep 1 ;;
     esac

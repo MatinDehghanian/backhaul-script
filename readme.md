@@ -61,6 +61,7 @@ The script offers these transports: `tcp`, `tcpmux`, `xtcpmux`, `ws`, `wss`, `ws
 | 4. Update Backhaul Core | Download the latest executable from this repository. Restart existing tunnel services afterward through tunnel management. |
 | 5. Update script | Download the latest script from this repository's GitHub raw URL, validate it, and install it as executable `/usr/bin/backhaul`. Run `backhaul` to reopen it. Failed updates keep the installed script. |
 | 6. Remove Backhaul Core | Remove the core after deleting all tunnel services. |
+| 7. Test all transports (ping and speed) | Compare transport availability between IRAN and KHAREJ, one temporary tunnel at a time, with ping, jitter, upload and download results. |
 | 0. Exit | Close the menu. |
 
 ## File locations
@@ -109,9 +110,26 @@ Choose one test:
 
 The KHAREJ backend port must be unused: the responder refuses occupied ports and never stops an application. If necessary, add an unused mapping such as `55000=55000` through **Edit → Port mappings**, then remove it after testing. Range mappings let you choose one port in the range.
 
-Only the selected existing tunnel carries test traffic. Testing starts no additional Backhaul core, changes no tunnel configuration, and does not try other transports or other mappings. A lock allows one diagnostic test per server at a time. To compare transports, edit both ends (or update KHAREJ using a fresh setup link), then test the new transport separately.
+Only the selected existing tunnel carries this test traffic. This selected-tunnel test starts no additional Backhaul core, changes no tunnel configuration, and does not try other transports or mappings. A lock allows one diagnostic test per server at a time. Use main-menu **7. Test all transports** for an automatic comparison of transport candidates.
 
 Keep the test link private. The temporary responder supports PROXY protocol headers and exits when the test finishes, when you cancel with Ctrl+C, or after ten minutes. A successful echo test proves the selected path carried those test bytes; it does not test every forwarded service or guarantee future route quality.
+
+## Compare all transports: availability, ping and speed
+
+This adapts [BackPack's Connection Test](https://github.com/AminMGMT/BackPack/blob/main/internal/manage/conntest.go) to the transports supported by this repository's Backhaul core. It creates temporary paired test tunnels and runs **one transport at a time**. It compares `tcp`, `tcpmux`, `xtcpmux`, `ws`, `wss`, `wsmux`, `wssmux`, `xwsmux`, `anytls`, `tun/tcp`, and `tun/ipx` with each of `icmp`, `ipip`, `udp`, `tcp`, `gre`, and `bip`.
+
+1. On IRAN, choose **7. Test all transports → 1) IRAN**. Enter the public address and two unused TCP ports (defaults: control `54000`, tunnel `54001`). The tunnel port is reused for every candidate so the comparison uses the same port on the route.
+2. Choose **Quick** (10 echoes over 5 seconds per working transport) or **Stability** (60 echoes over 60 seconds). Stability helps detect connections that drop after a short time. Each working transport also transfers a verified 8 MiB upload and 8 MiB download.
+3. Confirm the temporary pause. Copy the displayed `backhaul-compare://1.…` link.
+4. On KHAREJ, choose **7. Test all transports → 2) KHAREJ**, paste the link and confirm its temporary pause. Testing then starts automatically; both servers show the results.
+
+The table reports **AVAILABLE**, **UNSTABLE**, **DOWN**, **ERROR**, or **SKIPPED**, with average ping, jitter, upload/download Mbit/s and verified echo counts. **AVAILABLE** requires every echo and both payload transfers to succeed. Ping is application round-trip latency through the actual tunnel, rather than ICMP ping to the public server. Speeds are measured from IRAN: upload sends to KHAREJ, download receives from KHAREJ. Skipped prerequisites and startup errors have their own explanation; missing measurements show `-`. The fastest fully verified candidate is identified, and both servers save `/root/backhaul-core/transport-test-results.json` without test credentials.
+
+The comparison requires Python 3.9+, the installed executable, systemd, and a working TCP control path from KHAREJ to IRAN. Allow the selected control and tunnel TCP ports through existing firewalls. The script does not open firewall ports automatically. TLS tests generate a temporary certificate using OpenSSL. TUN requires root, `/dev/net/tun` and iproute2; IPX also requires an IPv4 path and a usable interface, which the tester detects from the control connection. Raw IPX profiles can fail through NAT or protocol filters even when TCP works. Missing prerequisites are reported as **SKIPPED**, not a measured route failure.
+
+Existing running managed Backhaul services are temporarily stopped on each server after confirmation; their configuration files and boot settings are preserved. IRAN waits for KHAREJ before pausing its services. Only one temporary Backhaul core runs per server, and KHAREJ must acknowledge that its previous core stopped before the next candidate starts. An unmanaged Backhaul core causes the comparison to stop instead of starting another instance. Temporary TUN devices use a random name and an unused subnet in `198.18.0.0/15`; forwarding uses Backhaul rather than iptables, and automatic kernel tuning is disabled for test configurations.
+
+On completion, Ctrl+C, or a handled failure, test processes, sockets, files and owned TUN interfaces are cleaned up, and previously running services are restarted. A failed service restore names the affected unit and recovery command. Use an SSH connection that does not depend on a tunnel being paused. IRAN waits up to ten minutes for KHAREJ, links expire after one hour, and the shared diagnostic lock prevents overlapping tests. Keep the test link private and keep both terminals open. Quick and stability results describe the tested route and settings at that time; they do not guarantee future reliability or production workload performance.
 
 ## Health and recovery
 
@@ -131,6 +149,7 @@ Tests use temporary files and simulated systemd services. With Bash 4+, jq, and 
 bash tests/tunnel_edit_test.sh
 bash tests/tunnel_features_test.sh
 python3 tests/connection_tool_test.py
+python3 tests/transport_comparison_test.py
 ```
 
-The last test uses loopback sockets and takes about one minute to verify the full echo soak. Tests simulate systemd; they do not run the Linux Backhaul binary or contact your servers. Use `TEST_BASH=/path/to/bash` for the Python test if your default Bash is older than version 4.
+The connection-tool test uses loopback sockets and takes about one minute to verify the full echo soak. The comparison tests exercise paired coordination, sequential engine cleanup, cancellation, separate verified upload/download measurements, and configuration generation for all 16 cases. Tests simulate systemd and comparison engines; they do not run the Linux Backhaul binary or contact your servers. Use `TEST_BASH=/path/to/bash` for the connection-tool Python test if your default Bash is older than version 4.
