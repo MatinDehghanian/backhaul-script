@@ -866,6 +866,548 @@ configure_server() {
 # SYSTEMD SERVICE MANAGEMENT
 # ============================================================================
 
+# Easy editor. Values stay serialized as TOML/JSON scalars; never source a config.
+declare -A EDIT_VALUES
+declare -a EDIT_SECTIONS
+
+edit_trim() {
+    local text="$1"
+    text="${text#"${text%%[![:space:]]*}"}"
+    text="${text%"${text##*[![:space:]]}"}"
+    printf '%s' "$text"
+}
+
+edit_strip_comment() {
+    local line="$1" result="" char quoted=false escaped=false i
+    for ((i=0; i<${#line}; i++)); do
+        char="${line:i:1}"
+        if [[ "$escaped" == true ]]; then
+            escaped=false
+        elif [[ "$quoted" == true && "$char" == \\ ]]; then
+            escaped=true
+        elif [[ "$char" == '"' ]]; then
+            [[ "$quoted" == true ]] && quoted=false || quoted=true
+        elif [[ "$quoted" == false && "$char" == '#' ]]; then
+            break
+        fi
+        result+="$char"
+    done
+    edit_trim "$result"
+}
+
+edit_load_config() {
+    local file="$1" line section="" key value normalized pending="" number=0
+    local section_pattern='^\[([a-zA-Z_][a-zA-Z0-9_]*)\]$'
+    local field_pattern='^([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$'
+    EDIT_VALUES=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((number+=1))
+        line=$(edit_strip_comment "$line")
+        [[ -z "$line" ]] && continue
+        if [[ -n "$pending" ]]; then
+            value+="$line"
+        elif [[ "$line" =~ $section_pattern ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        elif [[ -n "$section" && "$line" =~ $field_pattern ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            if [[ -n "${EDIT_VALUES[$section.$key]+present}" ]]; then
+                colorize red "Duplicate setting at line $number. File unchanged."
+                return 1
+            fi
+        else
+            colorize red "Cannot edit this TOML format at line $number. File unchanged."
+            return 1
+        fi
+        if [[ "$value" == \[* && "$value" != *\] ]]; then
+            pending=true
+            continue
+        fi
+        pending=""
+        # Script-generated TOML uses JSON-compatible strings/arrays and integers.
+        # Remove TOML integer separators and the trailing comma in mapping arrays.
+        if [[ "$value" =~ ^[0-9][0-9_]*$ ]]; then value="${value//_/}"; fi
+        normalized=$(printf '%s' "$value" | sed 's/,[[:space:]]*]$/]/' | jq -c '
+            if type == "string" or type == "boolean" or
+                (type == "number" and . >= 0 and floor == .) or
+                (type == "array" and all(.[]; type == "string")) then .
+            else error("Unsupported TOML value") end') || {
+            colorize red "Unsupported value at line $number. The editor supports script-generated TOML. File unchanged."
+            return 1
+        }
+        [[ -n "$normalized" && "$normalized" != *$'\n'* ]] || {
+            colorize red "Missing or invalid value at line $number. File unchanged."
+            return 1
+        }
+        EDIT_VALUES[$section.$key]="$normalized"
+    done < "$file"
+    if [[ -n "$pending" || -z "${EDIT_VALUES[transport.type]}" ]]; then
+        colorize red "Incomplete configuration. File unchanged."
+        return 1
+    fi
+}
+
+edit_value() {
+    local value="${EDIT_VALUES[$1]:-$2}"
+    [[ -n "$value" ]] && printf '%s' "$value" | jq -r 'if type == "array" then join(", ") else . end'
+}
+
+# Fields are listed in menu order with defaults for settings absent from a file.
+edit_fields() {
+    case "$1" in
+        listener) echo 'bind_addr|":8443"' ;;
+        dialer) cat <<'EOF'
+remote_addr|""
+dial_timeout|10
+retry_interval|3
+EOF
+            [[ "$(edit_value transport.type)" =~ ^(ws|wss|wsmux|wssmux|xwsmux)$ ]] && echo 'edge_ip|""'
+            ;;
+        transport) cat <<'EOF'
+type|"tcp"
+heartbeat_interval|10
+heartbeat_timeout|25
+EOF
+            if [[ "$(edit_value tun.encapsulation)" != ipx ]]; then
+                echo 'nodelay|true'
+                echo 'keepalive_period|40'
+            fi
+            if [[ "$edit_mode" == server ]]; then
+                [[ "$(edit_value transport.type)" == tcp ]] && echo 'accept_udp|false'
+                [[ ! "$(edit_value transport.type)" =~ ^(tun|ws)$ ]] && echo 'proxy_protocol|false'
+            elif [[ "$(edit_value transport.type)" != tun ]]; then
+                echo 'connection_pool|8'
+            fi
+            ;;
+        tun)
+            echo 'encapsulation|"tcp"'
+            echo 'name|"backhaul"'
+            if [[ "$edit_mode" == server ]]; then
+                echo 'local_addr|"10.10.10.1/24"'; echo 'remote_addr|"10.10.10.2/24"'
+            else
+                echo 'local_addr|"10.10.10.2/24"'; echo 'remote_addr|"10.10.10.1/24"'
+            fi
+            echo 'health_port|1234'
+            [[ "$(edit_value tun.encapsulation)" == ipx ]] && echo 'mtu|1320' || echo 'mtu|1500'
+            ;;
+        ipx)
+            local default_interface
+            default_interface=$(ip route show default 2>/dev/null | awk '{print $5; exit}') || default_interface=""
+            echo "listen_ip|$(jq -Rn --arg value "$SERVER_IP" '$value')"
+            cat <<'EOF'
+profile|"tcp"
+dst_ip|""
+EOF
+            echo "interface|$(jq -Rn --arg value "$default_interface" '$value')"
+            if [[ "$(edit_value ipx.profile)" == icmp ]]; then
+                echo 'icmp_type|0'; echo 'icmp_code|0'
+            fi
+            ;;
+        mux) cat <<'EOF'
+mux_version|2
+mux_concurrency|8
+mux_framesize|32768
+mux_recievebuffer|4194304
+mux_streambuffer|2097152
+EOF
+            ;;
+        security)
+            if [[ "$(edit_value tun.encapsulation)" == ipx ]]; then
+                echo 'enable_encryption|true'
+                if [[ "$(edit_value security.enable_encryption true)" == true ]]; then
+                    echo 'algorithm|"aes-256-gcm"'; echo 'psk|""'; echo 'kdf_iterations|100000'
+                fi
+            else
+                echo 'token|""'
+            fi
+            ;;
+        tls)
+            [[ "$(edit_value transport.type)" == anytls ]] && echo 'sni|"www.digikala.com"'
+            if [[ "$edit_mode" == server ]]; then
+                echo "tls_cert|$(jq -Rn --arg value "$CERT_FILE" '$value')"
+                echo "tls_key|$(jq -Rn --arg value "$KEY_FILE" '$value')"
+            fi
+            ;;
+        tuning)
+            cat <<'EOF'
+auto_tuning|true
+tuning_profile|"balanced"
+workers|0
+channel_size|4096
+so_sndbuf|0
+EOF
+            if [[ "$(edit_value tun.encapsulation)" == ipx ]]; then
+                echo 'batch_size|2048'
+            else
+                echo 'tcp_mss|0'; echo 'so_rcvbuf|0'
+            fi
+            if [[ "$(edit_value transport.type)" != tun ]]; then
+                echo 'buffer_profile|"balanced"'; echo 'read_timeout|120'
+            fi
+            ;;
+        accept_udp) cat <<'EOF'
+ring_size|64
+frame_size|2048
+peer_idle_timeout_s|120
+write_timeout_ms|3
+EOF
+            ;;
+        logging) echo 'log_level|"info"' ;;
+        ports)
+            echo 'mapping|[]'
+            [[ "$(edit_value transport.type)" == tun ]] && echo 'forwarder|"backhaul"'
+            ;;
+    esac
+    return 0
+}
+
+edit_sections() {
+    local transport="$(edit_value transport.type)"
+    EDIT_SECTIONS=()
+    if [[ "$transport" != tun || "$(edit_value tun.encapsulation)" != ipx ]]; then
+        [[ "$edit_mode" == server ]] && EDIT_SECTIONS+=(listener) || EDIT_SECTIONS+=(dialer)
+    fi
+    EDIT_SECTIONS+=(transport)
+    if [[ "$transport" == tun ]]; then
+        EDIT_SECTIONS+=(tun)
+        [[ "$(edit_value tun.encapsulation)" == ipx ]] && EDIT_SECTIONS+=(ipx)
+    fi
+    [[ "$transport" == *mux ]] && EDIT_SECTIONS+=(mux)
+    EDIT_SECTIONS+=(security)
+    if [[ "$transport" =~ ^(anytls|wss|wssmux)$ ]]; then
+        [[ "$edit_mode" == server || "$transport" == anytls || " ${!EDIT_VALUES[*]} " == *' tls.'* ]] && EDIT_SECTIONS+=(tls)
+    fi
+    EDIT_SECTIONS+=(tuning logging)
+    [[ "$edit_mode" == server && "$transport" == tcp && "$(edit_value transport.accept_udp)" == true ]] && EDIT_SECTIONS+=(accept_udp)
+    [[ "$edit_mode" == server ]] && EDIT_SECTIONS+=(ports)
+    return 0
+}
+
+edit_label() {
+    case "$1" in
+        listener|dialer) echo 'Connection address' ;;
+        transport) echo 'Transport and connection options' ;;
+        tun) echo 'TUN addresses and device' ;;
+        ipx) echo 'IPX encapsulation' ;;
+        mux) echo 'Multiplexing' ;;
+        security) echo 'Security' ;;
+        tls) echo 'TLS certificates / SNI' ;;
+        tuning) echo 'Performance' ;;
+        logging) echo 'Logging' ;;
+        accept_udp) echo 'UDP forwarding' ;;
+        ports) echo 'Port mappings' ;;
+        *) local label="${1//_/ }"; printf '%s\n' "${label^}" ;;
+    esac
+}
+
+edit_choices() {
+    case "$1" in
+        transport.type) echo 'tcp tcpmux xtcpmux ws wss wsmux wssmux xwsmux anytls tun' ;;
+        tun.encapsulation) echo 'tcp ipx' ;;
+        ipx.profile) echo 'icmp ipip udp tcp gre bip' ;;
+        security.algorithm) echo 'aes-256-gcm chacha20-poly1305 aes-128-gcm' ;;
+        tuning.tuning_profile) echo 'balanced fast latency resource' ;;
+        tuning.buffer_profile) echo 'extreme_low_cpu ultra_low_cpu low_cpu balanced low_memory' ;;
+        logging.log_level) echo 'panic fatal error warn info debug trace' ;;
+        ports.forwarder) echo 'backhaul iptables' ;;
+        mux.mux_version) echo '1 2' ;;
+    esac
+}
+
+edit_valid_mappings() {
+    local input="$1" mapping part first last
+    local -a mappings parts
+    input="${input// /}"
+    [[ -z "$input" ]] && return 0
+    IFS=',' read -r -a mappings <<< "$input"
+    for mapping in "${mappings[@]}"; do
+        if [[ "$(edit_value transport.type)" == tun ]]; then
+            [[ "$mapping" =~ ^[0-9]{1,5}(=[0-9]{1,5})?$ ]] || return 1
+        else
+            [[ "$mapping" =~ ^[0-9]{1,5}(-[0-9]{1,5}(:[0-9]{1,5})?|=[0-9]{1,5})?$ ]] || return 1
+        fi
+        # Ranges must be ascending, and every port must be in 1-65535.
+        IFS='=:' read -r first last <<< "$mapping"
+        if [[ "$first" == *-* ]]; then
+            IFS='-' read -r first part <<< "$first"
+            ((10#$first <= 10#$part)) || return 1
+        fi
+        IFS='-=:' read -r -a parts <<< "$mapping"
+        for part in "${parts[@]}"; do
+            ((10#$part >= 1 && 10#$part <= 65535)) || return 1
+        done
+    done
+}
+
+edit_prompt_field() {
+    local id="$1" default="$2" current type input encoded choices i
+    local -a options
+    current=$(edit_value "$id" "$default")
+    type=$(printf '%s' "${EDIT_VALUES[$id]:-$default}" | jq -r type)
+    choices=$(edit_choices "$id")
+    echo
+    colorize cyan "$(edit_label "${id#*.}"): $current" bold
+    echo 'Press Enter to keep the displayed value.'
+    if [[ "$type" == boolean ]]; then
+        options=(true false)
+    elif [[ -n "$choices" ]]; then
+        read -r -a options <<< "$choices"
+    fi
+    if ((${#options[@]})); then
+        for i in "${!options[@]}"; do echo " $((i+1))) ${options[$i]}"; done
+    elif [[ "$type" == array ]]; then
+        if [[ "$(edit_value transport.type)" == tun ]]; then
+            echo 'TUN mappings: comma-separated ports or pairs, e.g. 443,8443=443.'
+        else
+            echo 'Enter comma-separated mappings, e.g. 443,8443=443,5000-5010.'
+        fi
+        echo 'Use - to clear all mappings.'
+    elif [[ "$id" == dialer.edge_ip ]]; then
+        echo 'Use - to clear the optional edge address.'
+    fi
+    while true; do
+        read -r -p 'New value: ' input || return 1
+        if [[ -z "$input" ]]; then input="$current"; fi
+        if ((${#options[@]})); then
+            if [[ "$input" =~ ^[0-9]+$ ]] && ((10#$input >= 1 && 10#$input <= ${#options[@]})); then
+                input="${options[$((10#$input-1))]}"
+            fi
+            if [[ " ${options[*]} " != *" $input "* ]]; then
+                colorize red 'Choose one of the listed options.'; continue
+            fi
+        fi
+        case "$id" in
+            listener.bind_addr)
+                [[ "$input" != *:* ]] && input=":$input"
+                if [[ ! "$input" =~ ^[^[:space:]]*:([0-9]{1,5})$ ]] || ((10#${BASH_REMATCH[1]:-0} < 1 || 10#${BASH_REMATCH[1]:-0} > 65535)); then
+                    colorize red 'Use an address ending in :port (1-65535).'; continue
+                fi ;;
+            dialer.remote_addr)
+                if [[ ! "$input" =~ ^[^[:space:]]+:([0-9]{1,5})$ ]] || ((10#${BASH_REMATCH[1]:-0} < 1 || 10#${BASH_REMATCH[1]:-0} > 65535)); then
+                    colorize red 'Enter the IRAN server IP or domain with :port (1-65535).'; continue
+                fi ;;
+            tun.local_addr|tun.remote_addr)
+                validate_cidr "$input" || { colorize red 'Enter a host address with CIDR, e.g. 10.10.10.1/24.'; continue; } ;;
+            security.token|security.psk|ipx.dst_ip|ipx.interface|tls.tls_cert|tls.tls_key)
+                [[ -n "$input" ]] || { colorize red 'This setting cannot be empty.'; continue; } ;;
+            dialer.edge_ip) [[ "$input" == - ]] && input="" ;;
+        esac
+        case "$type" in
+            boolean) encoded="$input" ;;
+            number)
+                input="${input//_/}"
+                [[ "$input" =~ ^[0-9]{1,10}$ ]] || { colorize red 'Enter a non-negative whole number.'; continue; }
+                encoded="$((10#$input))"
+                if [[ "$id" == tun.health_port ]] && ((encoded < 1 || encoded > 65535)); then
+                    colorize red 'Port must be 1-65535.'; continue
+                fi ;;
+            array)
+                [[ "$input" == - ]] && input=""
+                input="${input// /}"
+                if [[ "$id" == ports.mapping ]] && ! edit_valid_mappings "$input"; then
+                    colorize red 'Use valid ports (1-65535), mappings, or ascending ranges.'; continue
+                fi
+                encoded=$(jq -cn --arg value "$input" '$value | split(",") | map(select(length > 0))')
+                ;;
+            string) encoded=$(jq -cn --arg value "$input" '$value') ;;
+            *) colorize red 'Unsupported setting type.'; return 1 ;;
+        esac
+        EDIT_VALUES[$id]="$encoded"
+        return 0
+    done
+}
+
+# Remove settings belonging to the old transport, preserving shared/custom fields.
+edit_normalize() {
+    local id section transport="$(edit_value transport.type)"
+    edit_sections
+    for id in "${!EDIT_VALUES[@]}"; do
+        section="${id%%.*}"
+        case "$section" in
+            listener|dialer|tun|ipx|mux|security|tls|accept_udp|ports)
+                [[ " ${EDIT_SECTIONS[*]} " == *" $section "* ]] || unset 'EDIT_VALUES[$id]' ;;
+        esac
+    done
+    [[ "$transport" == tcp && "$edit_mode" == server ]] || unset 'EDIT_VALUES[transport.accept_udp]'
+    [[ "$transport" =~ ^(tun|ws)$ || "$edit_mode" == client ]] && unset 'EDIT_VALUES[transport.proxy_protocol]'
+    [[ "$transport" == tun || "$edit_mode" == server ]] && unset 'EDIT_VALUES[transport.connection_pool]'
+    [[ "$transport" == tun ]] || unset 'EDIT_VALUES[ports.forwarder]'
+    [[ "$transport" =~ ^(ws|wss|wsmux|wssmux|xwsmux)$ ]] || unset 'EDIT_VALUES[dialer.edge_ip]'
+    [[ "$transport" == anytls ]] || unset 'EDIT_VALUES[tls.sni]'
+    if [[ "$(edit_value tun.encapsulation)" == ipx ]]; then
+        unset 'EDIT_VALUES[transport.nodelay]' 'EDIT_VALUES[transport.keepalive_period]'
+        unset 'EDIT_VALUES[security.token]' 'EDIT_VALUES[tuning.tcp_mss]' 'EDIT_VALUES[tuning.so_rcvbuf]'
+        EDIT_VALUES[ipx.mode]="\"$edit_mode\""
+    else
+        unset 'EDIT_VALUES[security.enable_encryption]' 'EDIT_VALUES[security.algorithm]'
+        unset 'EDIT_VALUES[security.psk]' 'EDIT_VALUES[security.kdf_iterations]' 'EDIT_VALUES[tuning.batch_size]'
+    fi
+    if [[ "$transport" == tun ]]; then
+        unset 'EDIT_VALUES[tuning.buffer_profile]' 'EDIT_VALUES[tuning.read_timeout]'
+    fi
+    if [[ "$(edit_value security.enable_encryption)" == false ]]; then
+        unset 'EDIT_VALUES[security.algorithm]' 'EDIT_VALUES[security.psk]' 'EDIT_VALUES[security.kdf_iterations]'
+    fi
+    [[ "$(edit_value ipx.profile)" == icmp ]] || unset 'EDIT_VALUES[ipx.icmp_type]' 'EDIT_VALUES[ipx.icmp_code]'
+    edit_sections
+}
+
+edit_complete_transport() {
+    local section key default
+    edit_normalize
+    colorize yellow 'Complete any settings required by this transport. Existing values are kept.'
+    # TUN encapsulation and encryption change which fields are required.
+    if [[ "$(edit_value transport.type)" == tun && -z "${EDIT_VALUES[tun.encapsulation]}" ]]; then
+        edit_prompt_field tun.encapsulation '"tcp"' || return 1
+        edit_normalize
+    fi
+    for section in "${EDIT_SECTIONS[@]}"; do
+        if [[ "$section" == security && "$(edit_value tun.encapsulation)" == ipx && -z "${EDIT_VALUES[security.enable_encryption]}" ]]; then
+            edit_prompt_field security.enable_encryption true || return 1
+        fi
+        if [[ "$section" == ipx && -z "${EDIT_VALUES[ipx.profile]}" ]]; then
+            edit_prompt_field ipx.profile '"tcp"' || return 1
+        fi
+        # Keep the field catalog on a separate descriptor so prompts read the user.
+        while IFS='|' read -r -u 3 key default; do
+            if [[ "$section.$key" == ports.mapping ]] && ! edit_valid_mappings "$(edit_value ports.mapping)"; then
+                colorize yellow 'The current port mappings need adjustment for this transport.'
+                edit_prompt_field ports.mapping "$default" || return 1
+            fi
+            [[ -n "${EDIT_VALUES[$section.$key]+present}" ]] && continue
+            case "$section.$key" in
+                transport.*|dialer.edge_ip|dialer.dial_timeout|dialer.retry_interval|accept_udp.*|tuning.*|logging.*)
+                    EDIT_VALUES[$section.$key]="$default" ;;
+                *) edit_prompt_field "$section.$key" "$default" || return 1 ;;
+            esac
+        done 3< <(edit_fields "$section")
+    done
+    edit_normalize
+}
+
+edit_section_menu() {
+    local section="$1" key default choice i id
+    local -a keys defaults
+    while true; do
+        keys=(); defaults=()
+        echo
+        colorize cyan "$(edit_label "$section")" bold
+        while IFS='|' read -r key default; do
+            keys+=("$key"); defaults+=("$default")
+        done < <(edit_fields "$section")
+        # Include additional scalar fields already present in this section.
+        while IFS= read -r id; do
+            [[ "$id" == "$section."* ]] || continue
+            key="${id#*.}"
+            [[ " ${keys[*]} " == *" $key "* ]] && continue
+            keys+=("$key"); defaults+=("${EDIT_VALUES[$id]}")
+        done < <(printf '%s\n' "${!EDIT_VALUES[@]}" | sort)
+        for i in "${!keys[@]}"; do
+            printf ' %s) %s: %s\n' "$((i+1))" "$(edit_label "${keys[$i]}")" "$(edit_value "$section.${keys[$i]}" "${defaults[$i]}")"
+        done
+        echo ' 0) Back'
+        read -r -p 'Select a setting to change: ' choice || return 1
+        [[ "$choice" == 0 ]] && return 0
+        if [[ ! "$choice" =~ ^[0-9]{1,3}$ ]] || ((10#$choice < 1 || 10#$choice > ${#keys[@]})); then
+            colorize red 'Invalid option.'; continue
+        fi
+        i=$((10#$choice-1))
+        edit_prompt_field "$section.${keys[$i]}" "${defaults[$i]}" || return 1
+        case "$section.${keys[$i]}" in
+            transport.type|tun.encapsulation|security.enable_encryption|ipx.profile|transport.accept_udp)
+                edit_complete_transport || return 1 ;;
+        esac
+        edit_normalize
+        [[ " ${EDIT_SECTIONS[*]} " == *" $section "* ]] || return 0
+    done
+}
+
+edit_write_config() {
+    local output="$1" id section
+    # Preserve additional sections/fields instead of regenerating a subset.
+    {
+        while IFS= read -r section; do
+            echo "[$section]"
+            while IFS= read -r id; do
+                [[ "$id" == "$section."* ]] && printf '%s = %s\n' "${id#*.}" "${EDIT_VALUES[$id]}"
+            done < <(printf '%s\n' "${!EDIT_VALUES[@]}" | sort)
+            echo
+        done < <(printf '%s\n' "${!EDIT_VALUES[@]}" | cut -d. -f1 | sort -u)
+    } > "$output"
+}
+
+edit_save_config() {
+    local file="$1" service="$2" temporary cert key
+    cert=$(edit_value tls.tls_cert); key=$(edit_value tls.tls_key)
+    if [[ "$edit_mode" == server && " ${EDIT_SECTIONS[*]} " == *' tls '* ]]; then
+        if [[ "$cert" == "$CERT_FILE" && "$key" == "$KEY_FILE" && ( ! -f "$cert" || ! -f "$key" ) ]]; then
+            colorize yellow 'Generating the default TLS certificate and key...'
+            openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 \
+                -keyout "$key" -out "$cert" -subj '/CN=backhaul.com' || return 1
+        fi
+        if [[ ! -f "$cert" || ! -f "$key" ]]; then
+            colorize red 'TLS certificate/key not found. Set valid paths before saving.'
+            return 1
+        fi
+    fi
+    temporary=$(mktemp "${file}.edit.XXXXXX") || return 1
+    if ! edit_write_config "$temporary" || ! chmod 600 "$temporary" || ! cp -p "$file" "${file}.bak" || ! mv -f "$temporary" "$file"; then
+        rm -f "$temporary"
+        colorize red 'Could not save the configuration.'
+        return 1
+    fi
+    if systemctl restart "$service" && sleep 1 && systemctl is-active --quiet "$service"; then
+        colorize green "✔ Saved and restarted $service. Backup: ${file}.bak" bold
+        return 0
+    fi
+    colorize red 'The edited tunnel failed to restart. Restoring its previous configuration.'
+    if cp -p "${file}.bak" "$file" && systemctl restart "$service" && sleep 1 && systemctl is-active --quiet "$service"; then
+        colorize yellow 'Previous configuration restored and restarted. Your edits are still in the menu.'
+    else
+        colorize red "Recovery failed. Check systemctl status $service. Backup: ${file}.bak"
+    fi
+    return 1
+}
+
+edit_tunnel() {
+    local file="$1" config_name="$(basename "${1%.toml}")" edit_mode choice i section id
+    local service="backhaul-${config_name}.service"
+    [[ "$config_name" == iran* ]] && edit_mode=server || edit_mode=client
+    edit_load_config "$file" || { press_key; return 1; }
+    while true; do
+        edit_sections
+        echo
+        colorize cyan "Edit $config_name — $(edit_value transport.type)" bold
+        echo 'Choose a group, then a setting. Changes apply only when you save.'
+        for i in "${!EDIT_SECTIONS[@]}"; do
+            section="${EDIT_SECTIONS[$i]}"
+            printf ' %s) %s\n' "$((i+1))" "$(edit_label "$section")"
+            while IFS= read -r id; do
+                [[ "$id" == "$section."* ]] && printf '    %s: %s\n' "$(edit_label "${id#*.}")" "$(edit_value "$id")"
+            done < <(printf '%s\n' "${!EDIT_VALUES[@]}" | sort)
+        done
+        echo ' s) Save changes and restart tunnel'
+        echo ' 0) Cancel (discard edits)'
+        read -r -p 'Select an option: ' choice || return 1
+        case "$choice" in
+            0) return 0 ;;
+            s|S)
+                # Complete dependencies even if input was interrupted earlier.
+                edit_complete_transport || return 1
+                colorize yellow 'Transport/security settings must also match on the other server.'
+                if edit_save_config "$file" "$service"; then press_key; return 0; fi
+                press_key ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]{1,3}$ ]] && ((10#$choice >= 1 && 10#$choice <= ${#EDIT_SECTIONS[@]})); then
+                    edit_section_menu "${EDIT_SECTIONS[$((10#$choice-1))]}" || return 1
+                else
+                    colorize red 'Invalid option.'
+                fi ;;
+        esac
+    done
+}
+
 create_systemd_service() {
     local type="$1"
     local port="$2"
@@ -1111,6 +1653,7 @@ tunnel_management() {
     colorize yellow "2) Restart this tunnel"
     echo "3) View service logs"
     echo "4) View service status"
+    colorize cyan "5) Edit this tunnel (easy menu)"
     echo
     read -r -p "Enter your choice (0 to return): " choice
 
@@ -1119,6 +1662,7 @@ tunnel_management() {
         2) restart_service "$service_name" ;;
         3) view_service_logs "$service_name" ;;
         4) view_service_status "$service_name" ;;
+        5) edit_tunnel "$selected_config" ;;
         0) return ;;
         *) colorize red "Invalid option!" && sleep 1 ;;
     esac
